@@ -1,0 +1,3 @@
+vscode [ alt + f12 ]
+커맨드 창에서 아래 명렁어 실행
+./run-32bit-python.bat
