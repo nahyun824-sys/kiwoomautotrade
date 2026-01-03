@@ -1,3 +1,10 @@
 vscode [ alt + f12 ]
 커맨드 창에서 아래 명렁어 실행
-./run-32bit-python.bat
+
+0) /venv가 없으면 1) 실행, 있으면 2) 실행
+
+1) install-requirements.bat
+> 32비트 파이썬 가상환경을 설치한다
+
+2) run.bat
+> 프로젝트 실행
