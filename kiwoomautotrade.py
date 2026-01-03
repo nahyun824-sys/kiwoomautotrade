@@ -1,23 +1,4 @@
 ﻿# -*- coding: utf-8 -*-
-"""
-Kiwoom 조건식 자동매매 (통합 완성본)
-
-- 매수 조건: BUY_COND_NAMES
-- 매도 조건: SELL_COND_NAMES (w, x2 등) <<<<< 여기 정의만 사용 (하드코딩 X)
-- SELL 유효 종목 집합 = sell_cond_codes[w] ∪ sell_cond_codes[x2] ∪ ...
-- 매도 조건 이탈(D) 즉시 전량 매도
-- 시작 후 AUTO-SELL 유예(기본 180초): SELL 초기 편입 세트 수신 전 강제매도 방지
-- 1분마다 AUTO-SELL 점검:
-    (1) -10% 손절
-    (2) 매도조건 1:1 매핑 실패(= SELL 유효 집합에 없으면) 전량 매도
-- 조건식 구독 안정화:
-    (1) SendCondition 실패(ret=0) 시 SendConditionStop 후 재시도 + 딜레이/backoff
-
-✅ 이번 패치 핵심:
-- "분할매수" 허용 (보유중이어도 30만원 한도 남으면 매수 가능)
-- "미체결 매수"까지 포함한 30만원 캡 강제 (보유평가 + 미체결추정 <= MAX_POSITION_PER_CODE)
-- pending 해제는 "미체결수량=0"일 때만 (실전 중복매수 방지 핵심)
-"""
 
 import sys
 import time
@@ -45,6 +26,10 @@ PRICE_RETRY_SLEEP = 0.8
 BALANCE_COOLDOWN_SEC = 3
 AUTO_SELL_START_GRACE_SEC = 180
 
+# ✅ 비밀번호(보안상 비추천) - 비워두고 ShowAccountWindow 창에서 입력해도 됨
+PASSWD = ""
+PASSWD_MEDIA = "00"  # 00: 공통
+
 # 화면번호(중복 사용 금지)
 SCREEN_LOGIN = "0000"
 SCREEN_TR_PRICE = "1001"
@@ -67,7 +52,18 @@ class Kiwoom(QAxWidget):
     def __init__(self):
         super().__init__()
 
+        print("[INIT] 프로그램 초기화 시작")
+
+        # ✅ ActiveX 생성
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
+        if self.isNull():
+            print("[ERROR] ❌ KHOpenAPI ActiveX 생성 실패 (32비트/설치/권한 확인 필요)")
+            # 아래 멤버 최소 생성(크래시 방지)
+            self.login_loop = None
+            self.condver_loop = None
+            self.price_loop = None
+            self.balance_loop = None
+            return
 
         # 이벤트 연결
         self.OnEventConnect.connect(self._on_event_connect)
@@ -92,17 +88,15 @@ class Kiwoom(QAxWidget):
         self.cond_index_to_name = {}
 
         # 보유/포지션/주문 상태
-        self.holdings = {}       # code -> qty (잔고TR/체잔 반영)
-        self.pos = {}            # code -> {"avg_price": int, "qty": int, "buy_cond": str, "buy_time": datetime}
+        self.holdings = {}          # code -> qty (잔고TR/체잔 반영)
+        self.pos = {}               # code -> {"avg_price": int, "qty": int, "buy_cond": str, "buy_time": datetime}
         self.pending_codes = set()  # 코드 단위 "주문 진행중" 마킹
 
         # ✅ 주문번호 기반 pending 추적 (실전 안전)
-        # order_no -> {"code","side","qty","est_price","unfilled_qty"}
-        self.pending_orders = {}
+        self.pending_orders = {}  # order_no -> {"code","side","qty","est_price","unfilled_qty"}
 
         # ✅ 코드별 미체결 매수 노출금액(추정) 캐시
-        # code -> sum(unfilled_qty * est_price)
-        self.pending_buy_exposure = {}
+        self.pending_buy_exposure = {}  # code -> sum(unfilled_qty * est_price)
 
         # 매수 큐
         self.buy_queue = deque()     # (code, cond_name)
@@ -193,11 +187,6 @@ class Kiwoom(QAxWidget):
     # ---------------------------
     # Kiwoom API wrapper
     # ---------------------------
-    def comm_connect(self):
-        print("[LOGIN] 로그인 요청")
-        self._dc("CommConnect()")
-        self.login_loop.exec_()
-
     def get_login_info(self, tag):
         return self._dc("GetLoginInfo(QString)", [tag])
 
@@ -245,17 +234,59 @@ class Kiwoom(QAxWidget):
         return self._dc("GetMasterCodeName(QString)", [code])
 
     # ---------------------------
+    # ✅ (교체됨) 로그인/계좌확인/ShowAccountWindow
+    # ---------------------------
+    def comm_connect(self):
+        """
+        두번째 코드 방식:
+        - GetConnectState 출력
+        - CommConnect 호출
+        - OnEventConnect에서 계좌/서버구분 세팅
+        """
+        state = self._dc("GetConnectState()")
+        print(f"[LOGIN] GetConnectState={state} (1=연결,0=미연결)")
+        print("[LOGIN] CommConnect() 호출")
+        self._dc("CommConnect()")
+        self.login_loop.exec_()
+
+    def show_account_window(self):
+        """
+        ✅ (44) 입력창/팝업 흐름 통과용
+        """
+        print("[UI] KOA_Functions('ShowAccountWindow') 호출 (계좌/비번 입력창 유도)")
+        try:
+            ret = self._dc("KOA_Functions(QString, QString)", ["ShowAccountWindow", ""])
+            print(f"[UI] ShowAccountWindow ret={ret}")
+        except Exception as e:
+            print(f"[UI] ShowAccountWindow 호출 실패: {repr(e)}")
+
+    # ---------------------------
     # 이벤트 핸들러
     # ---------------------------
     def _on_event_connect(self, err_code):
-        if err_code == 0:
-            print("[LOGIN] 로그인 성공")
-            self.account_no = self.get_login_info("ACCNO").split(";")[0].strip()
-            self.server_gubun = self.get_login_info("GetServerGubun")
-            print(f"[LOGIN] 계좌번호: {self.account_no}")
-            print(f"[LOGIN] 서버구분(1=모의, 0=실): {self.server_gubun}")
-        else:
-            print(f"[LOGIN] 로그인 실패 err_code={err_code}")
+        print(f"[EVENT] OnEventConnect err_code={err_code}")
+
+        if int(err_code) != 0:
+            print("[LOGIN] ❌ 로그인 실패/취소")
+            self.login_loop.exit()
+            return
+
+        print("[LOGIN] ✅ 로그인 성공")
+
+        accno = self.get_login_info("ACCNO")
+        acc_list = [a.strip() for a in str(accno).split(";") if a.strip()]
+        print(f"[LOGIN] ACCNO(list)={acc_list}")
+
+        if not acc_list:
+            print("[ERROR] 계좌번호를 못 가져왔어")
+            self.login_loop.exit()
+            return
+
+        self.account_no = acc_list[0]
+        self.server_gubun = self.get_login_info("GetServerGubun")  # 1=모의, 0=실 (환경에 따라 공백일 수도 있음)
+        print(f"[LOGIN] 계좌번호: {self.account_no}")
+        print(f"[LOGIN] 서버구분(1=모의, 0=실): {self.server_gubun}")
+
         self.login_loop.exit()
 
     def _on_receive_condition_ver(self, ret, msg):
@@ -410,19 +441,14 @@ class Kiwoom(QAxWidget):
                 filled_qty = self._safe_int(self._dc("GetChejanData(int)", [FID_FILLED_QTY]))
                 filled_price = self._safe_int(self._dc("GetChejanData(int)", [FID_FILLED_PRICE]))
 
-                # 주문구분에 "매수"/"매도"가 들어오는 경우가 많음(환경에 따라 +매수/-매도 등)
                 side = "BUY" if ("매수" in order_gubun) else ("SELL" if ("매도" in order_gubun) else None)
 
-                # pending_orders 업데이트
                 if order_no:
                     if order_no not in self.pending_orders:
-                        # est_price는 "주문 넣을 때 추정가"를 쓰는 게 맞는데,
-                        # 체잔에서 주문가가 비거나 시장가는 0일 수 있어서,
-                        # 여기선 체결가/현재가/0 중 가능한 걸로 보수적으로 잡음
                         est = filled_price if (filled_price and filled_price > 0) else (self.price_cache.get(code) or 0)
                         self.pending_orders[order_no] = {
                             "code": code,
-                            "side": side or "BUY",     # 모르면 BUY로 두면 위험할 수 있으니, 아래 unfilled 없으면 pending 유지됨
+                            "side": side or "BUY",
                             "qty": order_qty or 0,
                             "est_price": est or 0,
                             "unfilled_qty": unfilled_qty if unfilled_qty is not None else (order_qty or 0),
@@ -438,25 +464,19 @@ class Kiwoom(QAxWidget):
                             o["unfilled_qty"] = unfilled_qty
                         if status:
                             o["status"] = status
-                        # 체결가가 들어오면 추정가를 체결가로 보정(분할체결 방어)
                         if filled_price and filled_price > 0:
                             o["est_price"] = filled_price
 
-                # pending_codes 해제는 "미체결 0"일 때만
-                # (미체결수량 FID가 안 들어오면 안전하게 유지)
                 if unfilled_qty is not None and unfilled_qty == 0:
                     if code in self.pending_codes:
                         self.pending_codes.discard(code)
                         print(f"[CHEJAN-PENDING] 해제: {code}({name}) (unfilled=0)")
                 else:
-                    # 아직 미체결이 남아있으면 pending 유지
                     self.pending_codes.add(code)
 
-                # 노출금액 재계산
                 self._recalc_pending_buy_exposure()
 
             elif gubun == "1":
-                # 잔고 반영
                 qty_raw = self._dc("GetChejanData(int)", [930])
                 qty = self._safe_int(qty_raw)
                 if qty is not None:
@@ -484,8 +504,8 @@ class Kiwoom(QAxWidget):
         self._last_balance_ts = now
         print("[BALANCE] 요청: opw00018 잔고조회")
         self.set_input_value("계좌번호", self.account_no)
-        self.set_input_value("비밀번호", "0000")
-        self.set_input_value("비밀번호입력매체구분", "00")
+        self.set_input_value("비밀번호", PASSWD)  # ✅ 비워둬도 됨(ShowAccountWindow에서 입력)
+        self.set_input_value("비밀번호입력매체구분", PASSWD_MEDIA)
         self.set_input_value("조회구분", "2")
         self.comm_rq_data("opw00018_balance", "opw00018", 0, SCREEN_TR_BALANCE)
         self.balance_loop.exec_()
@@ -524,9 +544,6 @@ class Kiwoom(QAxWidget):
     # ✅ 한도 계산 유틸 (보유 + 미체결 포함)
     # ---------------------------
     def _get_position_exposure(self, code, price):
-        """
-        code의 현재 노출금액(추정) = 보유수량*price + 미체결매수노출
-        """
         code = self._strip_code(code)
         held_qty = self.holdings.get(code, 0) or 0
         held_value = (held_qty * price) if (price and price > 0) else 0
@@ -540,24 +557,20 @@ class Kiwoom(QAxWidget):
         code = self._strip_code(code)
         print(f"[BUY-TRIGGER] {reason} -> cond={cond_name}, target={self._fmt(code)}")
 
-        # ✅ 큐 중복 방지
         if code in self.buy_queue_set:
             print(f"[BUY-QUEUE] 스킵: 이미 대기열에 존재 -> {self._fmt(code)}")
             return
 
-        # ✅ 주문 진행중이면 스킵
         if code in self.pending_codes:
             print(f"[BUY-QUEUE] 스킵: 진행중 주문 존재 -> {self._fmt(code)}")
             return
 
-        # ✅ 너무 빠른 재트리거 방지
         last_ts = self.last_buy_ts.get(code, 0)
         if self._ts() - last_ts < 2.0:
             print(f"[BUY-QUEUE] 스킵: 너무 빠른 재트리거 -> {self._fmt(code)}")
             return
         self.last_buy_ts[code] = self._ts()
 
-        # ✅ 분할매수는 여기서 막지 않음 (한도는 실제 주문 직전에 계산)
         self.buy_queue.append((code, cond_name))
         self.buy_queue_set.add(code)
         print(f"[BUY-QUEUE] 추가: {self._fmt(code)} cond={cond_name} queue_len={len(self.buy_queue)}")
@@ -576,10 +589,6 @@ class Kiwoom(QAxWidget):
         self._buy_market_split_cap(code, TARGET_BUY_AMOUNT, cond_name)
 
     def _buy_market_split_cap(self, code, budget, cond_name):
-        """
-        ✅ 분할매수 + 종목당 한도(MAX_POSITION_PER_CODE) 강제
-        (보유평가 + 미체결추정 + 이번주문) <= MAX_POSITION_PER_CODE
-        """
         code = self._strip_code(code)
         print(f"[BUY] 진입: target={self._fmt(code)} budget={budget} cond={cond_name}")
 
@@ -588,7 +597,6 @@ class Kiwoom(QAxWidget):
             print(f"[BUY-SKIP] 현재가 조회 실패 -> 스킵: {self._fmt(code)} price={price}")
             return
 
-        # ✅ 현재 노출(보유+미체결) 계산
         exposure = self._get_position_exposure(code, price)
         remaining = MAX_POSITION_PER_CODE - exposure
 
@@ -605,7 +613,6 @@ class Kiwoom(QAxWidget):
 
         order_amount = qty * price
 
-        # ✅ 최종 안전장치: 이번 주문까지 합쳐도 한도 넘으면 qty 줄이기
         if exposure + order_amount > MAX_POSITION_PER_CODE:
             max_qty = int((MAX_POSITION_PER_CODE - exposure) // price)
             if max_qty <= 0:
@@ -617,7 +624,6 @@ class Kiwoom(QAxWidget):
         print(f"[BUY] 계산: {self._fmt(code)} price={price} qty={qty} order_amount={order_amount} "
               f"(exposure={exposure}, after={exposure + order_amount}/{MAX_POSITION_PER_CODE})")
 
-        # ✅ 주문 진행중 마킹
         self.pending_codes.add(code)
 
         print(f"[BUY] 주문전송: {self._fmt(code)} qty={qty} 시장가")
@@ -626,7 +632,6 @@ class Kiwoom(QAxWidget):
         if int(ret) == 0:
             print(f"[BUY] ✅ 주문성공: {self._fmt(code)} qty={qty} used={order_amount}")
 
-            # pos 기록(간단 추정, 잔고/체잔으로 보정됨)
             prev = self.pos.get(code)
             if not prev:
                 self.pos[code] = {
@@ -636,7 +641,6 @@ class Kiwoom(QAxWidget):
                     "buy_time": self._now(),
                 }
             else:
-                # 분할매수: 단순 가중평균(추정)
                 old_qty = prev.get("qty", 0) or 0
                 old_avg = prev.get("avg_price", 0) or 0
                 new_qty = old_qty + qty
@@ -647,10 +651,7 @@ class Kiwoom(QAxWidget):
                 prev["qty"] = new_qty
                 prev["avg_price"] = new_avg
                 prev["buy_cond"] = cond_name
-                # buy_time은 최초 유지
 
-            # ✅ 미체결 노출 추정값을 주문 직후에도 보수적으로 반영 (체잔 오기 전 중복 방지)
-            # (시장가라 주문가를 모르니 현재가로 추정)
             self.pending_buy_exposure[code] = self.pending_buy_exposure.get(code, 0) + (qty * price)
 
         else:
@@ -708,7 +709,6 @@ class Kiwoom(QAxWidget):
 
         print("[AUTO-SELL] 점검 시작 (1) 손절, (2) 매핑실패 매도")
 
-        # (1) 손절
         for code in list(current_codes):
             if code in pending_codes:
                 continue
@@ -728,7 +728,6 @@ class Kiwoom(QAxWidget):
                 print(f"[STOPLOSS] {STOPLOSS_PCT}% 이하 -> 전량 매도: {self._fmt(code)} pct={pct:.2f}%")
                 self._sell_all(code, sell_reason="STOPLOSS", with_lock=True)
 
-        # (2) 매도조건 매핑 실패
         for code in list(current_codes):
             if code in pending_codes:
                 continue
@@ -744,7 +743,24 @@ class Kiwoom(QAxWidget):
     # 실행 플로우
     # ---------------------------
     def run(self):
+        # ✅ ActiveX 실패면 바로 종료
+        if self.isNull():
+            print("[END] ActiveX 생성 실패로 종료")
+            return
+
+        # ✅ 로그인 (두번째 코드 방식)
         self.comm_connect()
+        if not self.account_no:
+            print("[END] 로그인/계좌확인 실패로 종료")
+            return
+
+        # ✅ (44) 팝업/비번 입력 흐름 유도
+        self.show_account_window()
+
+        # 사용자가 입력할 시간을 조금 줌 (너무 길게 잡을 필요는 없음)
+        time.sleep(1.5)
+
+        # 잔고/조건 로드
         self.request_balance(force=True)
         self.get_condition_load()
 
