@@ -1,9 +1,40 @@
 ﻿# -*- coding: utf-8 -*-
+"""
+Kiwoom OpenAPI+ 자동매매 통합본 (단일 파일)
+
+
+✅ 반영/수정 사항
+1) SendOrder dynamicCall TypeError 해결: 인자를 리스트로 넘기도록 고정
+2) BUY/SELL 조건 겹칠 때 중복 구독 방지 (w3, x2 같은 케이스)
+3) 매입 한도(MAX_POSITION_PER_CODE) = 보유+미체결+대기예산 포함 강제
+4) 재시작해도 당일 재매수 금지 유지(sold_today.json)
+5) 매도 직후 재매수 방지: 쿨다운 + qty=0 확정 전까지 차단
+6) 조건 이탈 매도는 지연매도(SELL_DELAY_SEC)만 스케줄 (즉시 매도 금지)
+7) 고아종목 제거(SELL 조건 어디에도 미편입이면 ORPHAN_GRACE 후 전량 매도)
+8) ✅ TR 직렬화(중복 QEventLoop exec 방지): request_price/balance/unfilled 모두 단일 TR 게이트로 처리
+9) ✅ [INFO] 로그에 종목코드 옆에 종목명 표시(간섭 최소)
+    - TR 요청 추가 없이 GetMasterCodeName(QString)로 조회
+    - 캐시 적용(동일 종목 반복 호출 최소화)
+10) ✅ 잔고/미체결 로그를 '변화가 있을 때만' 출력
+11) ✅ (요청사항) 비밀번호/ShowAccountWindow 흐름을 "아래 코드 방식"으로 교체
+    - PASSWD="" 가능
+    - start()에서 show_account_window() 호출
+    - opw00018 잔고조회 SetInputValue("비밀번호", PASSWD) 사용
+
+
+환경: Windows / Python 32-bit / PyQt5 / Kiwoom OpenAPI+
+중요: QAxWidget import = PyQt5.QAxContainer
+"""
+
 
 import sys
+import os
 import time
+import json
 import datetime
-from collections import deque
+from collections import deque, defaultdict
+from typing import Dict, Any, Optional, Set, Tuple
+
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
@@ -13,767 +44,1215 @@ from PyQt5.QtCore import QEventLoop, QTimer
 # =========================
 # 사용자 설정 (여기만 건드리면 됨)
 # =========================
-BUY_COND_NAMES = {"w1", "w2", "w3", "x1"}
-SELL_COND_NAMES = {"w", "x2"}
+BUY_COND_NAMES = {"w3", "x2"} # ✅ 매수 조건
+SELL_COND_NAMES = {"w", "w3", "x2"} # ✅ 매도 조건(이탈 트리거 → 지연매도)
 
-TARGET_BUY_AMOUNT = 300000       # 1회 매수 시도 예산(분할매수 단위)
-MAX_POSITION_PER_CODE = 300000   # ✅ 종목당 누적 보유(미체결 포함) 최대 한도
-STOPLOSS_PCT = -10.0
 
-AUTO_SELL_INTERVAL_SEC = 60
+TARGET_BUY_AMOUNT = 100000 # 1회 매수 예산(분할매수 단위)
+MAX_POSITION_PER_CODE = 100000 # ✅ 종목당 누적 노출(보유+미체결+대기예산) 최대 한도
+ALLOW_ADD_BUY = False  # ✅ 동일 종목 추가매수 허용 여부
+
+
+SELL_DELAY_SEC = 3.0    # ✅ 조건 이탈 시 지연매도 (우선)
+REBUY_COOLDOWN_SEC = 60.0  # ✅ 매도 직후 임시 재매수 금지(초)
+SOLD_TODAY_PERSIST = True  # ✅ 당일 재매수 금지 저장/로드
+
+
+STOPLOSS_PCT = -10.0    # (옵션)
+AUTO_SELL_INTERVAL_SEC = 60 # (옵션)
+
+
+BALANCE_COOLDOWN_SEC = 3.0 # 잔고 TR 과호출 방지
+PRICE_REQ_INTERVAL = 0.25  # 현재가 TR 과호출 방지
 PRICE_RETRY_MAX = 3
 PRICE_RETRY_SLEEP = 0.8
-BALANCE_COOLDOWN_SEC = 3
-AUTO_SELL_START_GRACE_SEC = 180
 
-# ✅ 비밀번호(보안상 비추천) - 비워두고 ShowAccountWindow 창에서 입력해도 됨
-PASSWD = ""
-PASSWD_MEDIA = "00"  # 00: 공통
+
+# 고아종목 제거
+ORPHAN_CHECK_INTERVAL_SEC = 10
+ORPHAN_GRACE_SEC = 60
+
+
+# 로그 설정
+LOG_LEVEL = "INFO"  # "DEBUG" / "INFO" / "WARN" / "ERROR"
+LOG_TO_FILE = True
+LOG_FILE_PATH = "kiwoomautotrade.log"
+LOG_THROTTLE_SEC = 2.0
+LOG_PRINT_CODELIST_MAX = 8
+
+
+# ✅ (교체) 비밀번호 입력 방식(아래 코드 방식)
+# - 보안상 비추천: 하드코딩하지 말고 PASSWD=""로 두고 ShowAccountWindow에서 입력해도 됨
+PASSWD = ""    # "" 가능
+PASSWD_MEDIA = "00" # 00: 공통
+
 
 # 화면번호(중복 사용 금지)
 SCREEN_LOGIN = "0000"
-SCREEN_TR_PRICE = "1001"
-SCREEN_TR_BALANCE = "1002"
-SCREEN_ORDER = "2001"
+SCREEN_TR_PRICE = "2000"
+SCREEN_TR_BAL = "2100"
+SCREEN_TR_UNFILLED = "2200"
+SCREEN_COND_BASE = 5000
 
 
-# ✅ Chejan FID (키움 표준)
-FID_CODE = 9001
-FID_ORDER_NO = 9203
-FID_ORDER_STATUS = 913     # 주문상태
-FID_ORDER_QTY = 900        # 주문수량
-FID_UNFILLED_QTY = 902     # 미체결수량
-FID_ORDER_GUBUN = 905      # 주문구분(+매수/-매도 등)
-FID_FILLED_QTY = 911       # 체결량
-FID_FILLED_PRICE = 910     # 체결가
+# 파일(당일 재매수 금지 저장)
+SOLD_TODAY_FILE = "sold_today.json"
+
+
+
+
+def _today_yyyymmdd() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d")
+
+
+
+
+def _now_hms() -> str:
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+
+
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(str(x).strip())
+    except:
+        return default
+
+
+
+
+def _norm_code(code: str) -> str:
+    if code is None:
+        return ""
+    code = str(code).strip()
+    if not code:
+        return ""
+    if code.startswith("A") and len(code) == 7:
+        code = code[1:]
+    return code
+
+
 
 
 class Kiwoom(QAxWidget):
     def __init__(self):
         super().__init__()
 
-        print("[INIT] 프로그램 초기화 시작")
 
-        # ✅ ActiveX 생성
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
-        if self.isNull():
-            print("[ERROR] ❌ KHOpenAPI ActiveX 생성 실패 (32비트/설치/권한 확인 필요)")
-            # 아래 멤버 최소 생성(크래시 방지)
-            self.login_loop = None
-            self.condver_loop = None
-            self.price_loop = None
-            self.balance_loop = None
-            return
+
 
         # 이벤트 연결
         self.OnEventConnect.connect(self._on_event_connect)
         self.OnReceiveTrData.connect(self._on_receive_tr_data)
+        self.OnReceiveMsg.connect(self._on_receive_msg)
+
+
         self.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
         self.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
         self.OnReceiveRealCondition.connect(self._on_receive_real_condition)
-        self.OnReceiveChejanData.connect(self._on_receive_chejan)
+
+
+        self.OnReceiveChejanData.connect(self._on_receive_chejan_data)
+
 
         # 루프
         self.login_loop = QEventLoop()
-        self.condver_loop = QEventLoop()
-        self.price_loop = QEventLoop()
-        self.balance_loop = QEventLoop()
+        self.tr_loop = QEventLoop()
+        self.cond_loop = QEventLoop()
 
-        # 계좌/서버
-        self.account_no = None
-        self.server_gubun = None
 
-        # 조건 목록/인덱스 매핑
-        self.cond_name_to_index = {}
-        self.cond_index_to_name = {}
+        # ✅ TR 직렬화(중복 exec 방지)
+        self._tr_busy = False
+        self._tr_busy_name = ""
+        self._tr_deadline = 0.0
+        self._tr_timeout_timer = QTimer()
+        self._tr_timeout_timer.timeout.connect(self._tr_timeout_tick)
 
-        # 보유/포지션/주문 상태
-        self.holdings = {}          # code -> qty (잔고TR/체잔 반영)
-        self.pos = {}               # code -> {"avg_price": int, "qty": int, "buy_cond": str, "buy_time": datetime}
-        self.pending_codes = set()  # 코드 단위 "주문 진행중" 마킹
 
-        # ✅ 주문번호 기반 pending 추적 (실전 안전)
-        self.pending_orders = {}  # order_no -> {"code","side","qty","est_price","unfilled_qty"}
+        # 상태
+        self.account = ""
+        self.server_gubun = ""
 
-        # ✅ 코드별 미체결 매수 노출금액(추정) 캐시
-        self.pending_buy_exposure = {}  # code -> sum(unfilled_qty * est_price)
+
+        # 조건
+        self.cond_name_to_idx: Dict[str, int] = {}
+        self.subscribed_conds: Set[str] = set() # ✅ 중복구독 방지용
+
+
+        # sell 조건 편입 집합(고아 판정용)
+        self.sell_cond_members: Dict[str, Set[str]] = defaultdict(set)
+
+
+        # 보유/미체결
+        self.holdings_qty: Dict[str, int] = defaultdict(int)
+        self.holdings_avg: Dict[str, int] = defaultdict(int)
+        self.holdings_name: Dict[str, str] = defaultdict(str)
+
+
+        self.unfilled_orders: Dict[str, Dict[str, Any]] = {}
+        self.pending_codes: Set[str] = set()
+
 
         # 매수 큐
-        self.buy_queue = deque()     # (code, cond_name)
-        self.buy_queue_set = set()   # code 중복 방지(큐)
-        self.last_buy_ts = {}        # code -> timestamp (짧은 시간 중복 트리거 방지)
+        self.buy_queue = deque() # (code, cond_name, ts)
+        self.buy_queue_set: Set[str] = set()
 
-        # 가격 캐시
-        self.price_cache = {}
-        self.price_waiting_code = None
-        self.price_waiting_retry = 0
 
-        # 잔고 쿨다운
-        self._last_balance_ts = 0.0
+        # 지연매도 예약
+        self.delayed_sells: Dict[Tuple[str, str], float] = {}
 
-        # SELL 조건별 세트
-        self.sell_cond_codes = {name: set() for name in SELL_COND_NAMES}
 
-        # AUTO-SELL 잠금
-        self.sell_exit_lock = set()
+        # 재매수 금지
+        self.sold_today: Set[str] = set()
+        self.rebuy_block_until: Dict[str, float] = {}
+        self.rebuy_block_pending: Set[str] = set()
 
-        # AUTO-SELL 시작 유예
-        self._start_ts = time.time()
-        self._auto_sell_grace_printed = False
+
+        # 고아 추적
+        self.orphan_first_seen: Dict[str, float] = {}
+
+
+        # TR 결과 임시
+        self._price_resp: Dict[str, int] = {}
+        self._last_price_req_ts = 0.0
+        self._last_balance_req_ts = 0.0
+
+
+        # ✅ (추가) 종목명 캐시 (TR 없이 조회)
+        self.code_name_cache: Dict[str, str] = {}
+
+
+        # ✅ (추가) 잔고/미체결 "변화 있을 때만" 로그용 signature
+        self._last_balance_sig = None
+        self._last_unfilled_sig = None
+
+
+        # 로거
+        self._init_logger()
+
+
+        self._log("INFO", "======================================================================")
+        self._log("INFO", "[BOOT-CONFIG] 실제 실행중 설정값 확인 (이게 로그랑 다르면 '다른 파일 실행중'임)")
+        self._log("INFO", f"[BOOT-CONFIG] __file__={__file__}")
+        self._log("INFO", f"[BOOT-CONFIG] BUY_COND_NAMES={BUY_COND_NAMES}")
+        self._log("INFO", f"[BOOT-CONFIG] SELL_COND_NAMES={SELL_COND_NAMES}")
+        self._log("INFO", f"[BOOT-CONFIG] TARGET_BUY_AMOUNT={TARGET_BUY_AMOUNT}")
+        self._log("INFO", f"[BOOT-CONFIG] MAX_POSITION_PER_CODE={MAX_POSITION_PER_CODE}")
+        self._log("INFO", f"[BOOT-CONFIG] ALLOW_ADD_BUY={ALLOW_ADD_BUY}")
+        self._log("INFO", f"[BOOT-CONFIG] PASSWD={'(EMPTY)' if PASSWD=='' else '(SET)'} / PASSWD_MEDIA={PASSWD_MEDIA}")
+        self._log("INFO", "======================================================================")
+
+
+        if SOLD_TODAY_PERSIST:
+            self._load_sold_today()
+
 
         # 타이머
-        self.timer_buy = QTimer()
-        self.timer_buy.timeout.connect(self._process_buy_queue)
+        self.buy_timer = QTimer()
+        self.buy_timer.timeout.connect(self._process_buy_queue_tick)
 
-        self.timer_auto_sell = QTimer()
-        self.timer_auto_sell.timeout.connect(self._auto_sell_check)
 
-        print("[INIT] 프로그램 초기화 완료")
+        self.delay_sell_timer = QTimer()
+        self.delay_sell_timer.timeout.connect(self._process_delayed_sells_tick)
 
-    # ---------------------------
-    # 공통 유틸
-    # ---------------------------
-    def _now(self):
-        return datetime.datetime.now()
 
-    def _ts(self):
-        return time.time()
+        self.orphan_timer = QTimer()
+        self.orphan_timer.timeout.connect(self._orphan_sweeper_tick)
 
-    def _safe_int(self, s):
-        try:
-            s = str(s).strip()
-            if s == "":
-                return None
-            return int(s)
-        except:
-            return None
 
-    def _strip_code(self, code):
-        return str(code).strip()
+        self.sync_timer = QTimer()
+        self.sync_timer.timeout.connect(self._periodic_sync_tick)
 
-    def _name(self, code):
-        code = self._strip_code(code)
-        try:
-            n = self.get_master_code_name(code)
-            return str(n).strip() if n else ""
-        except:
-            return ""
 
-    def _fmt(self, code):
-        code = self._strip_code(code)
-        n = self._name(code)
-        return f"{code}({n})" if n else f"{code}"
+    # -----------------------
+    # Logger
+    # -----------------------
+    def _init_logger(self):
+        self._log_level_map = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+        self._log_level = self._log_level_map.get(str(LOG_LEVEL).upper(), 20)
+        self._log_last_ts = {}
+        self._log_fp = None
+        if LOG_TO_FILE:
+            try:
+                self._log_fp = open(LOG_FILE_PATH, "a", encoding="utf-8")
+            except Exception as e:
+                print(f"[LOGGER] 파일 로그 오픈 실패: {e}")
 
-    def _get_valid_sell_union(self):
-        s = set()
-        for _name, _codes in self.sell_cond_codes.items():
-            s |= _codes
-        return s
 
-    def _get_screen_for_cond(self, cond_index):
-        return str(5000 + int(cond_index))
+    def _log(self, level: str, msg: str, key: str = None, throttle: float = None):
+        lv = self._log_level_map.get(level, 20)
+        if lv < self._log_level:
+            return
+        now = time.time()
+        if key:
+            th = LOG_THROTTLE_SEC if throttle is None else throttle
+            last = self._log_last_ts.get(key, 0.0)
+            if th and (now - last) < th:
+                return
+            self._log_last_ts[key] = now
+        line = f"[{_now_hms()}] [{level}] {msg}"
+        print(line)
+        if self._log_fp:
+            try:
+                self._log_fp.write(line + "\n")
+                self._log_fp.flush()
+            except:
+                pass
 
-    def _is_auto_sell_grace(self):
-        return (self._ts() - self._start_ts) < AUTO_SELL_START_GRACE_SEC
 
-    # ---------------------------
-    # ✅ 32비트 호환 dynamicCall 래퍼
-    # ---------------------------
-    def _dc(self, signature, args=None):
-        if args is None:
-            return self.dynamicCall(signature)
-        return self.dynamicCall(signature, args)
-
-    # ---------------------------
-    # Kiwoom API wrapper
-    # ---------------------------
-    def get_login_info(self, tag):
-        return self._dc("GetLoginInfo(QString)", [tag])
-
-    def get_condition_load(self):
-        self._dc("GetConditionLoad()")
-        self.condver_loop.exec_()
-
-    def send_condition(self, screen_no, cond_name, cond_index, search=1):
-        return self._dc(
-            "SendCondition(QString, QString, int, int)",
-            [screen_no, cond_name, int(cond_index), int(search)]
-        )
-
-    def send_condition_stop(self, screen_no, cond_name, cond_index):
-        return self._dc(
-            "SendConditionStop(QString, QString, int)",
-            [screen_no, cond_name, int(cond_index)]
-        )
-
-    def send_order(self, rqname, screen_no, acc_no, order_type, code, qty, price, hoga, org_order_no=""):
-        return self._dc(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [rqname, screen_no, acc_no, int(order_type), code, int(qty), int(price), hoga, org_order_no]
-        )
-
-    def set_input_value(self, key, value):
-        self._dc("SetInputValue(QString, QString)", [key, value])
-
-    def comm_rq_data(self, rqname, trcode, prev_next, screen_no):
-        return self._dc(
-            "CommRqData(QString, QString, int, QString)",
-            [rqname, trcode, int(prev_next), screen_no]
-        )
-
-    def get_comm_data(self, trcode, rqname, index, item):
-        return self._dc(
-            "GetCommData(QString, QString, int, QString)",
-            [trcode, rqname, int(index), item]
-        )
-
-    def get_repeat_cnt(self, trcode, rqname):
-        return self._dc("GetRepeatCnt(QString, QString)", [trcode, rqname])
-
-    def get_master_code_name(self, code):
-        return self._dc("GetMasterCodeName(QString)", [code])
-
-    # ---------------------------
-    # ✅ (교체됨) 로그인/계좌확인/ShowAccountWindow
-    # ---------------------------
-    def comm_connect(self):
-        """
-        두번째 코드 방식:
-        - GetConnectState 출력
-        - CommConnect 호출
-        - OnEventConnect에서 계좌/서버구분 세팅
-        """
-        state = self._dc("GetConnectState()")
-        print(f"[LOGIN] GetConnectState={state} (1=연결,0=미연결)")
-        print("[LOGIN] CommConnect() 호출")
-        self._dc("CommConnect()")
-        self.login_loop.exec_()
-
+    # -----------------------
+    # ✅ (추가) ShowAccountWindow (아래 코드 방식)
+    # -----------------------
     def show_account_window(self):
         """
-        ✅ (44) 입력창/팝업 흐름 통과용
+        ✅ KOA_Functions('ShowAccountWindow') 호출
+        - PASSWD를 비워둔 경우에도 사용자 입력창 흐름을 통과하기 위한 용도
         """
-        print("[UI] KOA_Functions('ShowAccountWindow') 호출 (계좌/비번 입력창 유도)")
+        self._log("INFO", "[UI] KOA_Functions('ShowAccountWindow') 호출(계좌/비번 입력창 유도)", key="SHOW_ACC_WIN", throttle=1.0)
         try:
-            ret = self._dc("KOA_Functions(QString, QString)", ["ShowAccountWindow", ""])
-            print(f"[UI] ShowAccountWindow ret={ret}")
+            ret = self.dynamicCall("KOA_Functions(QString, QString)", "ShowAccountWindow", "")
+            self._log("INFO", f"[UI] ShowAccountWindow ret={ret}", key="SHOW_ACC_WIN_RET", throttle=1.0)
         except Exception as e:
-            print(f"[UI] ShowAccountWindow 호출 실패: {repr(e)}")
+            self._log("WARN", f"[UI] ShowAccountWindow 호출 실패: {repr(e)}", key="SHOW_ACC_WIN_FAIL", throttle=2.0)
 
-    # ---------------------------
-    # 이벤트 핸들러
-    # ---------------------------
-    def _on_event_connect(self, err_code):
-        print(f"[EVENT] OnEventConnect err_code={err_code}")
 
-        if int(err_code) != 0:
-            print("[LOGIN] ❌ 로그인 실패/취소")
-            self.login_loop.exit()
-            return
+    # -----------------------
+    # ✅ 종목명 표시 (TR 간섭 없이)
+    # -----------------------
+    def _get_code_name(self, code: str) -> str:
+        code = _norm_code(code)
+        if not code:
+            return ""
 
-        print("[LOGIN] ✅ 로그인 성공")
 
-        accno = self.get_login_info("ACCNO")
-        acc_list = [a.strip() for a in str(accno).split(";") if a.strip()]
-        print(f"[LOGIN] ACCNO(list)={acc_list}")
+        nm = str(self.holdings_name.get(code, "")).strip()
+        if nm:
+            self.code_name_cache[code] = nm
+            return nm
 
-        if not acc_list:
-            print("[ERROR] 계좌번호를 못 가져왔어")
-            self.login_loop.exit()
-            return
 
-        self.account_no = acc_list[0]
-        self.server_gubun = self.get_login_info("GetServerGubun")  # 1=모의, 0=실 (환경에 따라 공백일 수도 있음)
-        print(f"[LOGIN] 계좌번호: {self.account_no}")
-        print(f"[LOGIN] 서버구분(1=모의, 0=실): {self.server_gubun}")
+        nm = str(self.code_name_cache.get(code, "")).strip()
+        if nm:
+            return nm
 
-        self.login_loop.exit()
-
-    def _on_receive_condition_ver(self, ret, msg):
-        if int(ret) == 1:
-            cond_list = self._dc("GetConditionNameList()")
-            items = [x for x in cond_list.split(";") if x.strip()]
-            for it in items:
-                idx, name = it.split("^")
-                idx = int(idx)
-                name = name.strip()
-                self.cond_name_to_index[name] = idx
-                self.cond_index_to_name[idx] = name
-
-            print("[COND] 조건 목록 로드 완료")
-            print(f"[COND] BUY_CONDITIONS={BUY_COND_NAMES} -> idx={ {self.cond_name_to_index[n] for n in BUY_COND_NAMES if n in self.cond_name_to_index} }")
-            print(f"[COND] SELL_CONDITIONS={SELL_COND_NAMES} -> idx={ {self.cond_name_to_index[n] for n in SELL_COND_NAMES if n in self.cond_name_to_index} }")
-
-            all_names = sorted(BUY_COND_NAMES | SELL_COND_NAMES)
-            for name in all_names:
-                if name not in self.cond_name_to_index:
-                    print(f"[COND-SUB] ❌ 조건식 없음 -> 스킵: {name}")
-                    continue
-
-                idx = self.cond_name_to_index[name]
-                scr = self._get_screen_for_cond(idx)
-
-                ok = 0
-                for try_no in range(1, 6):
-                    try:
-                        self.send_condition_stop(scr, name, idx)
-                    except Exception:
-                        pass
-
-                    time.sleep(0.3)
-                    ok = self.send_condition(scr, name, idx, 1)
-                    print(f"[COND-SUB] 구독 시도: {name} idx={idx} scr={scr} ret={ok} (try {try_no}/5)")
-
-                    if int(ok) == 1:
-                        print(f"[COND-SUB] ✅ 구독 성공: {name} idx={idx} scr={scr}")
-                        break
-
-                    time.sleep(0.8 + 0.4 * try_no)
-
-                if int(ok) != 1:
-                    print(f"[COND-SUB] ❌ 구독 최종 실패: {name} idx={idx}")
-
-        else:
-            print(f"[COND] 조건목록 로드 실패 ret={ret}, msg={msg}")
-
-        self.condver_loop.exit()
-
-    def _on_receive_tr_condition(self, screen_no, code_list, cond_name, cond_index, next_):
-        cond_name = str(cond_name).strip()
-        codes = [c.strip() for c in str(code_list).split(";") if c.strip()]
-
-        print(f"[TRCOND] scr={screen_no} cond={cond_name} idx={cond_index} next={next_}")
-        if codes:
-            pretty = ";".join([self._fmt(c) for c in codes])
-            print(f"[TRCOND] codes({len(codes)}): {pretty}")
-        else:
-            print("[TRCOND] codes(0): (empty)")
-
-        if cond_name in BUY_COND_NAMES:
-            for code in codes:
-                self._enqueue_buy(code, cond_name, reason="초기검색")
-
-        if cond_name in SELL_COND_NAMES:
-            self.sell_cond_codes[cond_name] = set(codes)
-            print(f"[SELL-COND-INIT] cond={cond_name} 편입세트({len(codes)}): {', '.join([self._fmt(c) for c in codes])}")
-
-    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
-        code = self._strip_code(code)
-        event_type = str(event_type).strip()
-        cond_name = str(cond_name).strip()
-
-        print(f"[COND-REAL] cond={cond_name} {'편입(I)' if event_type=='I' else '이탈(D)'}({event_type}): {self._fmt(code)}")
-
-        if cond_name in BUY_COND_NAMES and event_type == "I":
-            self._enqueue_buy(code, cond_name, reason="실시간")
-
-        if cond_name in SELL_COND_NAMES:
-            if event_type == "I":
-                self.sell_cond_codes[cond_name].add(code)
-            else:
-                self.sell_cond_codes[cond_name].discard(code)
-                self._sell_all(code, sell_reason=f"EXIT_{cond_name}", with_lock=True)
-
-    def _on_receive_tr_data(self, screen_no, rqname, trcode, recordname, prev_next, data_len, err_code, msg1, msg2):
-        rqname = str(rqname).strip()
-        trcode = str(trcode).strip()
-
-        if rqname == "opt10001_price":
-            code = self.price_waiting_code
-            price_raw = self.get_comm_data(trcode, rqname, 0, "현재가")
-            price = self._safe_int(price_raw.replace("+", "").replace("-", "")) if price_raw else None
-
-            self.price_cache[code] = price
-            print(f"[PRICE] 응답: {self._fmt(code)} 현재가={price}")
-            self.price_loop.exit()
-
-        elif rqname == "opw00018_balance":
-            cnt = self.get_repeat_cnt(trcode, rqname)
-            new_holdings = {}
-
-            for i in range(cnt):
-                code = self.get_comm_data(trcode, rqname, i, "종목번호").strip()
-                code = code.replace("A", "").strip()
-                qty_raw = self.get_comm_data(trcode, rqname, i, "보유수량").strip()
-                qty = self._safe_int(qty_raw)
-                if code and qty is not None and qty > 0:
-                    new_holdings[code] = qty
-
-            self.holdings = new_holdings
-            pretty = {self._fmt(k): v for k, v in self.holdings.items()}
-            print(f"[BALANCE] 보유종목({len(self.holdings)}): {pretty}")
-            self.balance_loop.exit()
-
-    # ---------------------------
-    # ✅ 주문/체결(체잔) 처리 (중복매수 방지 핵심)
-    # ---------------------------
-    def _recalc_pending_buy_exposure(self):
-        expo = {}
-        for o in self.pending_orders.values():
-            if o.get("side") != "BUY":
-                continue
-            code = o.get("code")
-            unfilled = o.get("unfilled_qty", 0) or 0
-            est_price = o.get("est_price", 0) or 0
-            if code and unfilled > 0 and est_price > 0:
-                expo[code] = expo.get(code, 0) + (unfilled * est_price)
-        self.pending_buy_exposure = expo
-
-    def _on_receive_chejan(self, gubun, item_cnt, fid_list):
-        gubun = str(gubun).strip()
-        print(f"[CHEJAN] 수신: gubun={gubun} item_cnt={item_cnt}")
 
         try:
-            code = self._dc("GetChejanData(int)", [FID_CODE]).strip()
-            code = code.replace("A", "").strip()
-            if not code:
-                return
+            nm = str(self.dynamicCall("GetMasterCodeName(QString)", code)).strip()
+        except:
+            nm = ""
 
-            name = self._name(code)
 
-            if gubun == "0":
-                order_no = str(self._dc("GetChejanData(int)", [FID_ORDER_NO]) or "").strip()
-                status = str(self._dc("GetChejanData(int)", [FID_ORDER_STATUS]) or "").strip()
-                order_gubun = str(self._dc("GetChejanData(int)", [FID_ORDER_GUBUN]) or "").strip()
+        if nm:
+            self.code_name_cache[code] = nm
+        return nm
 
-                order_qty = self._safe_int(self._dc("GetChejanData(int)", [FID_ORDER_QTY]))
-                unfilled_qty = self._safe_int(self._dc("GetChejanData(int)", [FID_UNFILLED_QTY]))
-                filled_qty = self._safe_int(self._dc("GetChejanData(int)", [FID_FILLED_QTY]))
-                filled_price = self._safe_int(self._dc("GetChejanData(int)", [FID_FILLED_PRICE]))
 
-                side = "BUY" if ("매수" in order_gubun) else ("SELL" if ("매도" in order_gubun) else None)
+    def _code_tag(self, code: str) -> str:
+        code = _norm_code(code)
+        if not code:
+            return ""
+        nm = self._get_code_name(code)
+        return f"{code}({nm})" if nm else code
 
-                if order_no:
-                    if order_no not in self.pending_orders:
-                        est = filled_price if (filled_price and filled_price > 0) else (self.price_cache.get(code) or 0)
-                        self.pending_orders[order_no] = {
-                            "code": code,
-                            "side": side or "BUY",
-                            "qty": order_qty or 0,
-                            "est_price": est or 0,
-                            "unfilled_qty": unfilled_qty if unfilled_qty is not None else (order_qty or 0),
-                            "status": status,
-                        }
-                    else:
-                        o = self.pending_orders[order_no]
-                        if side:
-                            o["side"] = side
-                        if order_qty is not None:
-                            o["qty"] = order_qty
-                        if unfilled_qty is not None:
-                            o["unfilled_qty"] = unfilled_qty
-                        if status:
-                            o["status"] = status
-                        if filled_price and filled_price > 0:
-                            o["est_price"] = filled_price
 
-                if unfilled_qty is not None and unfilled_qty == 0:
-                    if code in self.pending_codes:
-                        self.pending_codes.discard(code)
-                        print(f"[CHEJAN-PENDING] 해제: {code}({name}) (unfilled=0)")
-                else:
-                    self.pending_codes.add(code)
+    def _fmt_codelist(self, codes):
+        codes = list(codes) if codes else []
+        n = len(codes)
+        maxn = int(LOG_PRINT_CODELIST_MAX)
+        if maxn <= 0:
+            return f"{n} codes"
+        head = ", ".join([self._code_tag(c) for c in codes[:maxn]])
+        more = "" if n <= maxn else f" ... (+{n - maxn})"
+        return f"{n} codes: {head}{more}"
 
-                self._recalc_pending_buy_exposure()
 
-            elif gubun == "1":
-                qty_raw = self._dc("GetChejanData(int)", [930])
-                qty = self._safe_int(qty_raw)
-                if qty is not None:
-                    if qty > 0:
-                        self.holdings[code] = qty
-                    else:
-                        self.holdings.pop(code, None)
-                    print(f"[CHEJAN-HOLDINGS] 반영: {code}({name}) qty={qty} -> holdings_cnt={len(self.holdings)}")
+    # -----------------------
+    # ✅ TR 직렬화 게이트
+    # -----------------------
+    def _tr_request(self, rq_name: str, tr_code: str, screen: str, timeout_sec: float = 8.0) -> bool:
+        if self._tr_busy:
+            self._log(
+                "WARN",
+                f"[TR-SERIAL] busy({self._tr_busy_name}) -> skip rq={rq_name}",
+                key=f"TR_BUSY_{rq_name}",
+                throttle=0.5,
+            )
+            return False
 
-        except Exception:
+
+        self._tr_busy = True
+        self._tr_busy_name = rq_name
+        self._tr_deadline = time.time() + float(timeout_sec)
+
+
+        ret = self.dynamicCall("CommRqData(QString, QString, int, QString)", rq_name, tr_code, 0, screen)
+        if ret != 0:
+            self._log(
+                "WARN",
+                f"[TR-SERIAL] CommRqData fail ret={ret} rq={rq_name}",
+                key=f"TR_FAIL_{rq_name}",
+                throttle=0.5,
+            )
+            self._tr_busy = False
+            self._tr_busy_name = ""
+            self._tr_deadline = 0.0
+            return False
+
+
+        self._tr_timeout_timer.start(50)
+        self.tr_loop.exec_()
+        return not self._tr_busy
+
+
+    def _tr_release(self):
+        self._tr_busy = False
+        self._tr_busy_name = ""
+        self._tr_deadline = 0.0
+        try:
+            self._tr_timeout_timer.stop()
+        except:
             pass
 
-    # ---------------------------
-    # TR 요청 로직
-    # ---------------------------
-    def request_balance(self, force=False):
-        now = self._ts()
-        if not force and (now - self._last_balance_ts) < BALANCE_COOLDOWN_SEC:
-            print("[BALANCE] 최근 조회 -> 스킵")
-            return
-        if self.balance_loop.isRunning():
-            print("[BALANCE] balance_loop 동작중 -> 스킵")
+
+    def _tr_timeout_tick(self):
+        if not self._tr_busy:
+            try:
+                self._tr_timeout_timer.stop()
+            except:
+                pass
             return
 
-        self._last_balance_ts = now
-        print("[BALANCE] 요청: opw00018 잔고조회")
-        self.set_input_value("계좌번호", self.account_no)
-        self.set_input_value("비밀번호", PASSWD)  # ✅ 비워둬도 됨(ShowAccountWindow에서 입력)
-        self.set_input_value("비밀번호입력매체구분", PASSWD_MEDIA)
-        self.set_input_value("조회구분", "2")
-        self.comm_rq_data("opw00018_balance", "opw00018", 0, SCREEN_TR_BALANCE)
-        self.balance_loop.exec_()
 
-    def get_current_price(self, code):
-        code = self._strip_code(code)
+        if time.time() >= self._tr_deadline:
+            self._log(
+                "ERROR",
+                f"[TR-SERIAL] timeout rq={self._tr_busy_name} -> force release",
+                key=f"TR_TO_{self._tr_busy_name}",
+                throttle=0.5,
+            )
+            self._tr_release()
+            if self.tr_loop.isRunning():
+                self.tr_loop.exit()
 
-        if self.price_loop.isRunning():
-            cached = self.price_cache.get(code)
-            print(f"[PRICE] price_loop 동작중 -> 캐시반환: {self._fmt(code)} cached={cached}")
-            return cached
 
-        self.price_waiting_code = code
-        self.price_waiting_retry = 0
+    # -----------------------
+    # Login
+    # -----------------------
+    def comm_connect(self):
+        self._log("INFO", "[LOGIN] GetConnectState=%s (1=연결,0=미연결)" % self.dynamicCall("GetConnectState()"))
+        self._log("INFO", "[LOGIN] CommConnect() 호출")
+        self.dynamicCall("CommConnect()")
+        self.login_loop.exec_()
 
-        while self.price_waiting_retry < PRICE_RETRY_MAX:
-            self.set_input_value("종목코드", code)
-            ret = self.comm_rq_data("opt10001_price", "opt10001", 0, SCREEN_TR_PRICE)
 
-            if int(ret) == -200:
-                self.price_waiting_retry += 1
-                print(f"[PRICE] 과부하(-200) -> {PRICE_RETRY_SLEEP}s 대기 후 재시도({self.price_waiting_retry}/{PRICE_RETRY_MAX}): {self._fmt(code)}")
-                time.sleep(PRICE_RETRY_SLEEP)
+    def _on_event_connect(self, err_code):
+        self._log("INFO", f"[EVENT] OnEventConnect err_code={err_code}")
+        if err_code == 0:
+            self._log("INFO", "[LOGIN] ✅ 로그인 성공")
+            acc_list = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+            accs = [a for a in str(acc_list).split(";") if a]
+            self._log("INFO", f"[LOGIN] ACCNO(list)={accs}")
+            self.account = accs[0] if accs else ""
+            self._log("INFO", f"[LOGIN] 계좌번호: {self.account}")
+            self.server_gubun = str(self.dynamicCall("GetLoginInfo(QString)", "GetServerGubun")).strip()
+            self._log("INFO", f"[LOGIN] 서버구분(1=모의, 0=실): {self.server_gubun}")
+        else:
+            self._log("ERROR", f"[LOGIN] ❌ 로그인 실패 err_code={err_code}")
+
+
+        if self.login_loop.isRunning():
+            self.login_loop.exit()
+
+
+    # -----------------------
+    # Conditions
+    # -----------------------
+    def load_conditions(self):
+        ret = self.dynamicCall("GetConditionLoad()")
+        if ret == 0:
+            self._log("ERROR", "[COND] GetConditionLoad() 실패")
+            return
+        self.cond_loop.exec_()
+
+
+    def _on_receive_condition_ver(self, ret, msg):
+        self._log("INFO", "[COND] 조건 목록 로드 완료")
+        raw = str(self.dynamicCall("GetConditionNameList()"))
+        items = [x for x in raw.split(";") if x]
+        self.cond_name_to_idx.clear()
+        for it in items:
+            try:
+                idx_str, name = it.split("^", 1)
+                self.cond_name_to_idx[name] = int(idx_str)
+            except:
                 continue
-            if int(ret) != 0:
-                print(f"[PRICE] TR 요청 실패 ret={ret} code={self._fmt(code)}")
-                return None
 
-            print(f"[PRICE] TR요청 성공 -> 응답대기: {self._fmt(code)}")
-            self.price_loop.exec_()
-            return self.price_cache.get(code)
+
+        buy_idx = {self.cond_name_to_idx.get(n) for n in BUY_COND_NAMES if n in self.cond_name_to_idx}
+        sell_idx = {self.cond_name_to_idx.get(n) for n in SELL_COND_NAMES if n in self.cond_name_to_idx}
+        buy_idx.discard(None)
+        sell_idx.discard(None)
+
+
+        self._log("INFO", f"[COND] BUY_CONDITIONS={BUY_COND_NAMES} -> idx={buy_idx}")
+        self._log("INFO", f"[COND] SELL_CONDITIONS={SELL_COND_NAMES} -> idx={sell_idx}")
+
+
+        if self.cond_loop.isRunning():
+            self.cond_loop.exit()
+
+
+    def subscribe_conditions(self):
+        all_conds = list(sorted(set(SELL_COND_NAMES) | set(BUY_COND_NAMES)))
+
+
+        ordered = []
+        for c in sorted(SELL_COND_NAMES):
+            if c in all_conds:
+                ordered.append(c)
+        for c in sorted(BUY_COND_NAMES):
+            if c in all_conds and c not in ordered:
+                ordered.append(c)
+
+
+        for name in ordered:
+            if name not in self.cond_name_to_idx:
+                self._log("WARN", f"[COND] 조건명 없음 -> 스킵: {name}")
+                continue
+            if name in self.subscribed_conds:
+                continue
+            idx = self.cond_name_to_idx[name]
+            scr = str(SCREEN_COND_BASE + idx)
+            ok = self._send_condition_retry(name, idx, scr, search=1)
+            if ok:
+                self.subscribed_conds.add(name)
+
+
+    def _send_condition_retry(self, name: str, idx: int, scr: str, search: int) -> bool:
+        for i in range(1, 6):
+            ret = self.dynamicCall("SendCondition(QString, QString, int, int)", scr, name, idx, search)
+            self._log(
+                "INFO",
+                f"[COND-SUB] 구독 시도: {name} idx={idx} scr={scr} ret={ret} (try {i}/5)",
+                key=f"COND_SUB_{name}",
+                throttle=0.2,
+            )
+            if ret == 1:
+                self._log("INFO", f"[COND-SUB] ✅ 구독 성공: {name}")
+                return True
+            time.sleep(0.2)
+        self._log("ERROR", f"[COND-SUB] ❌ 구독 실패: {name}")
+        return False
+
+
+    def _on_receive_tr_condition(self, scr_no, code_list, cond_name, cond_index, next_):
+        codes = [c for c in str(code_list).split(";") if c]
+        cond_name = str(cond_name)
+
+
+        self._log("INFO", f"[TRCOND] scr={scr_no} cond={cond_name} idx={cond_index} next={next_}")
+        self._log("INFO", f"[TRCOND] {self._fmt_codelist(codes)}", key=f"TRCOND_{cond_name}", throttle=0.5)
+
+
+        if cond_name in SELL_COND_NAMES:
+            self.sell_cond_members[cond_name] = set(map(_norm_code, codes))
+            self._log(
+                "INFO",
+                f"[SELL-COND-INIT] cond={cond_name} -> {self._fmt_codelist(self.sell_cond_members[cond_name])}",
+                key=f"SELLINIT_{cond_name}",
+                throttle=0.5,
+            )
+
+
+        if cond_name in BUY_COND_NAMES:
+            for c in codes:
+                self._enqueue_buy(_norm_code(c), cond_name, ev="INITIAL_TRCOND")
+
+
+    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
+        code = _norm_code(code)
+        cond_name = str(cond_name)
+        event_type = str(event_type)
+
+
+        if not code:
+            return
+
+
+        if event_type == "I":
+            self._log(
+                "INFO",
+                f"[COND-REAL] cond={cond_name} 편입(I): {self._code_tag(code)}",
+                key=f"COND_I_{cond_name}_{code}",
+                throttle=0.5,
+            )
+            if cond_name in SELL_COND_NAMES:
+                self.sell_cond_members[cond_name].add(code)
+            if cond_name in BUY_COND_NAMES:
+                self._enqueue_buy(code, cond_name, ev="REAL_I")
+
+
+        elif event_type == "D":
+            self._log(
+                "INFO",
+                f"[COND-REAL] cond={cond_name} 이탈(D): {self._code_tag(code)}",
+                key=f"COND_D_{cond_name}_{code}",
+                throttle=0.5,
+            )
+            if cond_name in SELL_COND_NAMES:
+                self.sell_cond_members[cond_name].discard(code)
+                self._schedule_delayed_sell(code, cond_name, reason="COND_EXIT")
+
+
+    # -----------------------
+    # TR
+    # -----------------------
+    def _on_receive_tr_data(self, scr_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
+        rq_name = str(rq_name)
+
+
+        if rq_name == "opt10001_req":
+            code = _norm_code(
+                self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, 0, "종목코드")
+            )
+            price_raw = self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, 0, "현재가")
+            price = abs(_safe_int(price_raw, 0))
+            self._price_resp[code] = price
+
+
+            self._tr_release()
+            if self.tr_loop.isRunning():
+                self.tr_loop.exit()
+
+
+        elif rq_name == "opw00018_req":
+            self._parse_balance(tr_code, rq_name)
+
+
+            self._tr_release()
+            if self.tr_loop.isRunning():
+                self.tr_loop.exit()
+
+
+        elif rq_name == "opt10075_req":
+            self._parse_unfilled(tr_code, rq_name)
+
+
+            self._tr_release()
+            if self.tr_loop.isRunning():
+                self.tr_loop.exit()
+        else:
+            if self._tr_busy:
+                self._tr_release()
+            if self.tr_loop.isRunning():
+                self.tr_loop.exit()
+
+
+    def _on_receive_msg(self, scr_no, rq_name, tr_code, msg):
+        self._log("DEBUG", f"[MSG] scr={scr_no} rq={rq_name} tr={tr_code} msg={msg}", key="MSG", throttle=1.0)
+
+
+    def request_price(self, code: str) -> Optional[int]:
+        code = _norm_code(code)
+        if not code:
+            return None
+
+
+        now = time.time()
+        gap = now - self._last_price_req_ts
+        if gap < PRICE_REQ_INTERVAL:
+            time.sleep(PRICE_REQ_INTERVAL - gap)
+        self._last_price_req_ts = time.time()
+
+
+        self._price_resp.pop(code, None)
+        self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+
+
+        for attempt in range(1, PRICE_RETRY_MAX + 1):
+            ok = self._tr_request("opt10001_req", "opt10001", SCREEN_TR_PRICE, timeout_sec=6.0)
+            if ok:
+                price = self._price_resp.get(code, 0)
+                if price > 0:
+                    return price
+            else:
+                self._log(
+                    "WARN",
+                    f"[PRICE] TR요청 스킵/실패 attempt={attempt} code={self._code_tag(code)}",
+                    key=f"PRICE_FAIL_{code}",
+                    throttle=0.5,
+                )
+            time.sleep(PRICE_RETRY_SLEEP)
+
 
         return None
 
-    # ---------------------------
-    # ✅ 한도 계산 유틸 (보유 + 미체결 포함)
-    # ---------------------------
-    def _get_position_exposure(self, code, price):
-        code = self._strip_code(code)
-        held_qty = self.holdings.get(code, 0) or 0
-        held_value = (held_qty * price) if (price and price > 0) else 0
-        pending_value = self.pending_buy_exposure.get(code, 0) or 0
-        return held_value + pending_value
 
-    # ---------------------------
-    # BUY / SELL
-    # ---------------------------
-    def _enqueue_buy(self, code, cond_name, reason=""):
-        code = self._strip_code(code)
-        print(f"[BUY-TRIGGER] {reason} -> cond={cond_name}, target={self._fmt(code)}")
-
-        if code in self.buy_queue_set:
-            print(f"[BUY-QUEUE] 스킵: 이미 대기열에 존재 -> {self._fmt(code)}")
+    def request_balance(self):
+        now = time.time()
+        if now - self._last_balance_req_ts < BALANCE_COOLDOWN_SEC:
             return
+        self._last_balance_req_ts = now
+
+
+        self._log("DEBUG", "[BALANCE] 요청: opw00018 잔고조회", key="BAL_REQ", throttle=0.5)
+
+
+        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account)
+
+
+        # ✅ (교체) 아래 코드 방식: PASSWD 사용(빈값 가능)
+        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호", PASSWD)
+        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", PASSWD_MEDIA)
+
+
+        self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
+        self._tr_request("opw00018_req", "opw00018", SCREEN_TR_BAL, timeout_sec=8.0)
+
+
+    def request_unfilled(self):
+        self._log("DEBUG", "[UNFILLED] 요청: opt10075 미체결조회", key="UNF_REQ", throttle=0.5)
+
+
+        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account)
+        self.dynamicCall("SetInputValue(QString, QString)", "전체종목구분", "0")
+        self.dynamicCall("SetInputValue(QString, QString)", "매매구분", "0")
+        self.dynamicCall("SetInputValue(QString, QString)", "체결구분", "1")
+        self._tr_request("opt10075_req", "opt10075", SCREEN_TR_UNFILLED, timeout_sec=8.0)
+
+
+    # -----------------------
+    # ✅ 잔고/미체결 "변화 있을 때만" 로그를 위한 signature
+    # -----------------------
+    def _make_balance_sig(self, qty_map: Dict[str, int], avg_map: Dict[str, int]) -> Tuple[Tuple[str, int, int], ...]:
+        rows = []
+        for c in sorted(qty_map.keys()):
+            rows.append((c, int(qty_map.get(c, 0)), int(avg_map.get(c, 0))))
+        return tuple(rows)
+
+
+    def _make_unfilled_sig(self, unfilled: Dict[str, Dict[str, Any]]) -> Tuple[Tuple[str, str, str, int, int, int], ...]:
+        rows = []
+        for order_no in sorted(unfilled.keys()):
+            od = unfilled.get(order_no, {}) or {}
+            rows.append((
+                str(order_no),
+                _norm_code(od.get("code", "")),
+                str(od.get("bs", "")),
+                int(od.get("qty", 0) or 0),
+                int(od.get("unfilled", 0) or 0),
+                int(od.get("price", 0) or 0),
+            ))
+        return tuple(rows)
+
+
+    def _parse_balance(self, tr_code, rq_name):
+        cnt = _safe_int(self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name), 0)
+
+
+        new_qty = defaultdict(int)
+        new_avg = defaultdict(int)
+        new_name = defaultdict(str)
+
+
+        for i in range(cnt):
+            code = _norm_code(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "종목번호"))
+            name = str(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "종목명")).strip()
+            qty = _safe_int(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "보유수량"), 0)
+            avg = abs(_safe_int(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "평균단가"), 0))
+            if code and qty > 0:
+                new_qty[code] = qty
+                new_avg[code] = avg
+                new_name[code] = name
+                if name:
+                    self.code_name_cache[code] = name
+
+
+        new_sig = self._make_balance_sig(new_qty, new_avg)
+        changed = (new_sig != self._last_balance_sig)
+        self._last_balance_sig = new_sig
+
+
+        self.holdings_qty = new_qty
+        self.holdings_avg = new_avg
+        self.holdings_name = new_name
+
+
+        for code in list(self.rebuy_block_pending):
+            if self.holdings_qty.get(code, 0) <= 0:
+                self.rebuy_block_pending.discard(code)
+
+
+        if not changed:
+            return
+
+
+        self._log(
+            "INFO",
+            f"[BALANCE] 변경감지: 보유종목({len(self.holdings_qty)}): "
+            + "{%s}"
+            % ", ".join(
+                [
+                    f"{self._code_tag(c)}={q}"
+                    for c, q in list(self.holdings_qty.items())[:12]
+                ]
+            )
+            + (" ..." if len(self.holdings_qty) > 12 else ""),
+            key="BAL_CHANGED",
+            throttle=0.0,
+        )
+
+
+    def _parse_unfilled(self, tr_code, rq_name):
+        cnt = _safe_int(self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name), 0)
+        new_unfilled = {}
+        for i in range(cnt):
+            order_no = str(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "주문번호")).strip()
+            code = _norm_code(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "종목코드"))
+            bs = str(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "매매구분")).strip()
+            qty = abs(_safe_int(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "주문수량"), 0))
+            unfilled = abs(_safe_int(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "미체결수량"), 0))
+            price = abs(_safe_int(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, i, "주문가격"), 0))
+            if order_no and code and unfilled > 0:
+                new_unfilled[order_no] = {"code": code, "bs": bs, "qty": qty, "unfilled": unfilled, "price": price}
+
+
+        new_sig = self._make_unfilled_sig(new_unfilled)
+        changed = (new_sig != self._last_unfilled_sig)
+        self._last_unfilled_sig = new_sig
+
+
+        self.unfilled_orders = new_unfilled
+
+
+        live_pending_codes = set()
+        for od in self.unfilled_orders.values():
+            live_pending_codes.add(od["code"])
+        self.pending_codes = live_pending_codes
+
+
+        if not changed:
+            return
+
+
+        sample = []
+        for order_no in list(sorted(self.unfilled_orders.keys()))[:8]:
+            od = self.unfilled_orders[order_no]
+            sample.append(
+                f"{order_no}:{self._code_tag(od.get('code'))}/{od.get('bs')}/미체결{od.get('unfilled')}"
+            )
+        sample_txt = ", ".join(sample)
+        more = "" if len(self.unfilled_orders) <= 8 else f" ... (+{len(self.unfilled_orders) - 8})"
+        self._log(
+            "INFO",
+            f"[UNFILLED] 변경감지: 미체결 {len(self.unfilled_orders)}건 | {sample_txt}{more}",
+            key="UNF_CHANGED",
+            throttle=0.0,
+        )
+
+
+    # -----------------------
+    # Chejan
+    # -----------------------
+    def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
+        gubun = str(gubun)
+        self._log("DEBUG", f"[CHEJAN] gubun={gubun} item_cnt={item_cnt}", key=f"CHEJAN_{gubun}", throttle=1.0)
+
+
+        if gubun == "0":
+            order_no = str(self.dynamicCall("GetChejanData(int)", 9203)).strip()
+            code = _norm_code(self.dynamicCall("GetChejanData(int)", 9001))
+            bs = str(self.dynamicCall("GetChejanData(int)", 907)).strip()
+            unfilled = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 902), 0))
+            qty = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 900), 0))
+
+
+            if order_no and code:
+                if unfilled > 0:
+                    self.unfilled_orders[order_no] = {"code": code, "bs": bs, "qty": qty, "unfilled": unfilled, "price": 0}
+                    self.pending_codes.add(code)
+                else:
+                    self.unfilled_orders.pop(order_no, None)
+                    still = any(v["code"] == code and v.get("unfilled", 0) > 0 for v in self.unfilled_orders.values())
+                    if not still:
+                        self.pending_codes.discard(code)
+
+
+                try:
+                    self._last_unfilled_sig = self._make_unfilled_sig(self.unfilled_orders)
+                except:
+                    pass
+
+
+        elif gubun == "1":
+            code = _norm_code(self.dynamicCall("GetChejanData(int)", 9001))
+            name = str(self.dynamicCall("GetChejanData(int)", 302)).strip()
+            qty = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 930), 0))
+            avg = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 931), 0))
+
+
+            if code:
+                if qty > 0:
+                    self.holdings_qty[code] = qty
+                    self.holdings_avg[code] = avg
+                    self.holdings_name[code] = name
+                    if name:
+                        self.code_name_cache[code] = name
+                else:
+                    self.holdings_qty.pop(code, None)
+                    self.holdings_avg.pop(code, None)
+                    self.holdings_name.pop(code, None)
+                    self.rebuy_block_pending.discard(code)
+
+
+                try:
+                    self._last_balance_sig = self._make_balance_sig(self.holdings_qty, self.holdings_avg)
+                except:
+                    pass
+
+
+    # -----------------------
+    # Exposure / Limits
+    # -----------------------
+    def _estimate_exposure_code(self, code: str, price_hint: int = 0) -> int:
+        code = _norm_code(code)
+        hold_qty = self.holdings_qty.get(code, 0)
+        hold_avg = self.holdings_avg.get(code, 0)
+        hold_value = hold_qty * (hold_avg if hold_avg > 0 else price_hint)
+
+
+        pending_buy_value = 0
+        for od in self.unfilled_orders.values():
+            if od.get("code") != code:
+                continue
+            bs = str(od.get("bs", ""))
+            if "매수" in bs or bs.startswith("+"):
+                p = int(od.get("price", 0) or price_hint)
+                pending_buy_value += int(od.get("unfilled", 0)) * p
+
+
+        queued_budget = 0
+        for (c, _cond, _ts) in self.buy_queue:
+            if c == code:
+                queued_budget += TARGET_BUY_AMOUNT
+
+
+        return int(hold_value + pending_buy_value + queued_budget)
+
+
+    def _can_buy_code(self, code: str, price: int) -> Tuple[bool, str]:
+        code = _norm_code(code)
+        if not code:
+            return False, "INVALID_CODE"
+
+
+        if code in self.sold_today:
+            return False, "SOLD_TODAY_BLOCK"
+
+
+        until = self.rebuy_block_until.get(code, 0)
+        if time.time() < until:
+            return False, "REBUY_COOLDOWN"
+
+
+        if code in self.rebuy_block_pending:
+            return False, "REBUY_PENDING_QTY0"
+
+
+        if self.holdings_qty.get(code, 0) > 0 and not ALLOW_ADD_BUY:
+            return False, "ALREADY_HOLDING"
+
 
         if code in self.pending_codes:
-            print(f"[BUY-QUEUE] 스킵: 진행중 주문 존재 -> {self._fmt(code)}")
-            return
+            return False, "PENDING_ORDER"
 
-        last_ts = self.last_buy_ts.get(code, 0)
-        if self._ts() - last_ts < 2.0:
-            print(f"[BUY-QUEUE] 스킵: 너무 빠른 재트리거 -> {self._fmt(code)}")
-            return
-        self.last_buy_ts[code] = self._ts()
 
-        self.buy_queue.append((code, cond_name))
+        exposure = self._estimate_exposure_code(code, price_hint=price)
+        if exposure + TARGET_BUY_AMOUNT > MAX_POSITION_PER_CODE:
+            return False, f"MAX_POSITION_PER_CODE(exposure={exposure})"
+
+
+        if price <= 0 or TARGET_BUY_AMOUNT < price:
+            return False, f"INSUFFICIENT_FUNDS_1SHARE(price={price})"
+
+
+        return True, "OK"
+
+
+    # -----------------------
+    # Buy Queue
+    # -----------------------
+    def _enqueue_buy(self, code: str, cond_name: str, ev: str = ""):
+        code = _norm_code(code)
+        if not code:
+            return
+        if code in self.buy_queue_set:
+            return
+        if code in self.sold_today:
+            self._log("INFO", f"[BUY-QUEUE] 스킵: 재매수 금지 -> {self._code_tag(code)}", key=f"BUYQ_SOLD_{code}", throttle=1.0)
+            return
+        self.buy_queue.append((code, cond_name, time.time()))
         self.buy_queue_set.add(code)
-        print(f"[BUY-QUEUE] 추가: {self._fmt(code)} cond={cond_name} queue_len={len(self.buy_queue)}")
+        self._log("INFO", f"[BUY-QUEUE] 추가: {self._code_tag(code)} cond={cond_name} queue_len={len(self.buy_queue)}",
+                    key="BUYQ_ADD", throttle=0.2)
 
-    def _process_buy_queue(self):
+
+    def _send_order(self, name: str, screen: str, acc: str, order_type: int,
+                    code: str, qty: int, price: int, hoga: str, org_order_no: str) -> int:
+        sig = "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)"
+        args = [name, screen, acc, int(order_type), code, int(qty), int(price), hoga, org_order_no]
+        return self.dynamicCall(sig, args)
+
+
+    def _process_buy_queue_tick(self):
         if not self.buy_queue:
             return
 
-        code, cond_name = self.buy_queue.popleft()
+
+        code, cond, ts = self.buy_queue.popleft()
         self.buy_queue_set.discard(code)
 
-        if code in self.pending_codes:
-            print(f"[BUY-QUEUE] (deq) 스킵: 진행중 주문 존재 -> {self._fmt(code)}")
+
+        self._log("INFO", f"[BUY] 진입: target={self._code_tag(code)} budget={TARGET_BUY_AMOUNT} cond={cond}",
+                    key=f"BUY_ENTER_{code}", throttle=0.2)
+
+
+        price = self.request_price(code)
+        if not price:
+            self._log("WARN", f"[BUY] 현재가 실패 -> 스킵: {self._code_tag(code)}", key=f"BUY_NOPRICE_{code}", throttle=1.0)
             return
 
-        self._buy_market_split_cap(code, TARGET_BUY_AMOUNT, cond_name)
 
-    def _buy_market_split_cap(self, code, budget, cond_name):
-        code = self._strip_code(code)
-        print(f"[BUY] 진입: target={self._fmt(code)} budget={budget} cond={cond_name}")
-
-        price = self.get_current_price(code)
-        if not price or price <= 0:
-            print(f"[BUY-SKIP] 현재가 조회 실패 -> 스킵: {self._fmt(code)} price={price}")
+        ok, reason = self._can_buy_code(code, price)
+        if not ok:
+            self._log("INFO", f"[BUY] 스킵: {self._code_tag(code)} reason={reason}", key=f"BUY_BLOCK_{code}", throttle=0.5)
             return
 
-        exposure = self._get_position_exposure(code, price)
-        remaining = MAX_POSITION_PER_CODE - exposure
 
-        if remaining <= 0:
-            print(f"[BUY-SKIP] 한도초과(노출={exposure} >= {MAX_POSITION_PER_CODE}) -> 스킵: {self._fmt(code)}")
-            return
-
-        use_budget = min(int(budget), int(remaining))
-        qty = int(use_budget // price)
-
+        qty = TARGET_BUY_AMOUNT // price
         if qty <= 0:
-            print(f"[BUY-SKIP] 금액부족(1주 미만) -> 스킵: {self._fmt(code)} price={price} remaining={remaining} use_budget={use_budget}")
             return
+
 
         order_amount = qty * price
+        self._log("INFO", f"[BUY] 계산: {self._code_tag(code)} price={price} qty={qty} order_amount={order_amount}",
+                    key=f"BUY_CALC_{code}", throttle=0.2)
 
-        if exposure + order_amount > MAX_POSITION_PER_CODE:
-            max_qty = int((MAX_POSITION_PER_CODE - exposure) // price)
-            if max_qty <= 0:
-                print(f"[BUY-SKIP] 한도내 수량=0 -> 스킵: {self._fmt(code)} exposure={exposure} price={price}")
-                return
-            qty = max_qty
-            order_amount = qty * price
 
-        print(f"[BUY] 계산: {self._fmt(code)} price={price} qty={qty} order_amount={order_amount} "
-              f"(exposure={exposure}, after={exposure + order_amount}/{MAX_POSITION_PER_CODE})")
-
-        self.pending_codes.add(code)
-
-        print(f"[BUY] 주문전송: {self._fmt(code)} qty={qty} 시장가")
-        ret = self.send_order("buy_by_condition", SCREEN_ORDER, self.account_no, 1, code, qty, 0, "03")
-
-        if int(ret) == 0:
-            print(f"[BUY] ✅ 주문성공: {self._fmt(code)} qty={qty} used={order_amount}")
-
-            prev = self.pos.get(code)
-            if not prev:
-                self.pos[code] = {
-                    "avg_price": price,
-                    "qty": qty,
-                    "buy_cond": cond_name,
-                    "buy_time": self._now(),
-                }
-            else:
-                old_qty = prev.get("qty", 0) or 0
-                old_avg = prev.get("avg_price", 0) or 0
-                new_qty = old_qty + qty
-                if new_qty > 0:
-                    new_avg = int((old_avg * old_qty + price * qty) / new_qty)
-                else:
-                    new_avg = price
-                prev["qty"] = new_qty
-                prev["avg_price"] = new_avg
-                prev["buy_cond"] = cond_name
-
-            self.pending_buy_exposure[code] = self.pending_buy_exposure.get(code, 0) + (qty * price)
-
+        ret = self._send_order("BUY", "0101", self.account, 1, code, qty, 0, "03", "")
+        if ret == 0:
+            self._log("INFO", f"[BUY] ✅ 주문성공: {self._code_tag(code)} qty={qty}", key=f"BUY_OK_{code}", throttle=0.2)
+            self.pending_codes.add(code)
         else:
-            self.pending_codes.discard(code)
-            print(f"[BUY] ❌ 주문실패 ret={ret}: {self._fmt(code)}")
+            self._log("WARN", f"[BUY] ❌ 주문실패: {self._code_tag(code)} ret={ret}", key=f"BUY_FAIL_{code}", throttle=1.0)
 
-    def _sell_all(self, code, sell_reason="", with_lock=False):
-        code = self._strip_code(code)
 
-        qty = self.holdings.get(code, 0)
+    # -----------------------
+    # Delayed Sell
+    # -----------------------
+    def _schedule_delayed_sell(self, code: str, cond: str, reason: str):
+        code = _norm_code(code)
+        if not code:
+            return
+        due = time.time() + float(SELL_DELAY_SEC)
+        self.delayed_sells[(code, cond)] = due
+        self._log("INFO", f"[SELL-DELAY] 예약: {self._code_tag(code)} cond={cond} after={SELL_DELAY_SEC}s (reason={reason})",
+                    key=f"SELL_SCHED_{code}_{cond}", throttle=0.2)
+
+
+    def _process_delayed_sells_tick(self):
+        now = time.time()
+        keys = list(self.delayed_sells.keys())
+        for (code, cond) in keys:
+            due = self.delayed_sells.get((code, cond), 0)
+            if now < due:
+                continue
+
+
+            if cond in SELL_COND_NAMES and code in self.sell_cond_members.get(cond, set()):
+                self.delayed_sells.pop((code, cond), None)
+                continue
+
+
+            self.delayed_sells.pop((code, cond), None)
+
+
+            hold_qty = self.holdings_qty.get(code, 0)
+            if hold_qty <= 0:
+                continue
+            if code in self.pending_codes:
+                continue
+
+
+            self._request_sell_all(code, reason=f"EXIT_{cond}_DELAY{SELL_DELAY_SEC}s")
+
+
+    def _request_sell_all(self, code: str, reason: str):
+        code = _norm_code(code)
+        qty = self.holdings_qty.get(code, 0)
         if qty <= 0:
             return
 
-        if with_lock:
-            if code in self.sell_exit_lock:
-                return
-            self.sell_exit_lock.add(code)
 
-        if code in self.pending_codes:
-            print(f"[SELL] 스킵: 진행중 주문 존재 -> {self._fmt(code)}")
-            return
+        self._log("INFO", f"[SELL] 주문전송(전량): {self._code_tag(code)} qty={qty} 시장가 reason={reason}",
+                    key=f"SELL_SEND_{code}", throttle=0.2)
 
-        self.pending_codes.add(code)
-        print(f"[SELL] 진입: {self._fmt(code)} reason={sell_reason}")
 
-        p = self.get_current_price(code)
-        if p is not None:
-            print(f"[SELL] 현재가(참고): {self._fmt(code)} price={p}")
-
-        print(f"[SELL] 주문전송(전량): {self._fmt(code)} qty={qty} 시장가")
-        ret = self.send_order("sell_all", SCREEN_ORDER, self.account_no, 2, code, qty, 0, "03")
-
-        if int(ret) == 0:
-            print(f"[SELL] ✅ 주문성공: {self._fmt(code)} qty={qty} reason={sell_reason}")
-            self.pos.pop(code, None)
+        ret = self._send_order("SELL", "0102", self.account, 2, code, qty, 0, "03", "")
+        if ret == 0:
+            self._log("INFO", f"[SELL] ✅ 주문성공: {self._code_tag(code)} qty={qty} reason={reason}",
+                        key=f"SELL_OK_{code}", throttle=0.2)
+            self.pending_codes.add(code)
+            self._set_rebuy_block(code, cooldown_sec=REBUY_COOLDOWN_SEC)
         else:
-            self.pending_codes.discard(code)
-            if with_lock:
-                self.sell_exit_lock.discard(code)
-            print(f"[SELL] ❌ 주문실패 ret={ret}: {self._fmt(code)}")
+            self._log("WARN", f"[SELL] ❌ 주문실패: {self._code_tag(code)} ret={ret}", key=f"SELL_FAIL_{code}", throttle=1.0)
 
-    # ---------------------------
-    # AUTO-SELL
-    # ---------------------------
-    def _auto_sell_check(self):
-        if self._is_auto_sell_grace():
-            if not self._auto_sell_grace_printed:
-                self._auto_sell_grace_printed = True
-                print(f"[AUTO-SELL] 시작 유예 적용: {AUTO_SELL_START_GRACE_SEC}s 동안 AUTO-SELL 미동작")
+
+    # -----------------------
+    # Rebuy block (persist)
+    # -----------------------
+    def _set_rebuy_block(self, code: str, cooldown_sec: float):
+        code = _norm_code(code)
+        if not code:
             return
+        self.rebuy_block_until[code] = time.time() + float(cooldown_sec)
+        self.rebuy_block_pending.add(code)
 
-        current_codes = set(self.holdings.keys())
-        valid_sell_codes = self._get_valid_sell_union()
-        pending_codes = set(self.pending_codes)
 
-        print("[AUTO-SELL] 점검 시작 (1) 손절, (2) 매핑실패 매도")
+    def _promote_sold_today_if_confirmed(self):
+        for code, until in list(self.rebuy_block_until.items()):
+            if self.holdings_qty.get(code, 0) <= 0 and code not in self.rebuy_block_pending:
+                if code not in self.sold_today:
+                    self.sold_today.add(code)
+                    if SOLD_TODAY_PERSIST:
+                        self._save_sold_today()
 
-        for code in list(current_codes):
-            if code in pending_codes:
-                continue
-            if code not in self.pos:
-                continue
 
-            buy_price = self.pos[code].get("avg_price")
-            if not buy_price or buy_price <= 0:
-                continue
+    def _load_sold_today(self):
+        try:
+            if not os.path.exists(SOLD_TODAY_FILE):
+                return
+            with open(SOLD_TODAY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            day = data.get("day", "")
+            codes = set(map(_norm_code, data.get("codes", [])))
+            if day == _today_yyyymmdd():
+                self.sold_today = set(c for c in codes if c)
+                self._log("INFO", f"[SOLD-TODAY] 로드: {len(self.sold_today)}개", key="SOLD_LOAD", throttle=0.2)
+            else:
+                self.sold_today = set()
+        except Exception as e:
+            self._log("WARN", f"[SOLD-TODAY] 로드 실패: {e}", key="SOLD_LOAD_FAIL", throttle=1.0)
 
-            cur = self.get_current_price(code)
-            if not cur or cur <= 0:
-                continue
 
-            pct = (cur - buy_price) / buy_price * 100.0
-            if pct <= STOPLOSS_PCT:
-                print(f"[STOPLOSS] {STOPLOSS_PCT}% 이하 -> 전량 매도: {self._fmt(code)} pct={pct:.2f}%")
-                self._sell_all(code, sell_reason="STOPLOSS", with_lock=True)
+    def _save_sold_today(self):
+        try:
+            payload = {"day": _today_yyyymmdd(), "codes": sorted(list(self.sold_today))}
+            with open(SOLD_TODAY_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log("WARN", f"[SOLD-TODAY] 저장 실패: {e}", key="SOLD_SAVE_FAIL", throttle=1.0)
 
-        for code in list(current_codes):
-            if code in pending_codes:
-                continue
-            if code not in valid_sell_codes:
-                qty = self.holdings.get(code, 0)
-                if qty > 0:
-                    print(f"[AUTO-SELL] 매핑 실패 -> 전량 매도: {self._fmt(code)} qty={qty}")
-                    self._sell_all(code, sell_reason="AUTO_SELL_UNMAPPED", with_lock=True)
 
-        print("[AUTO-SELL] 점검 종료")
+    # -----------------------
+    # Orphan Sweeper
+    # -----------------------
+    def _is_in_any_sell_condition(self, code: str) -> bool:
+        code = _norm_code(code)
+        for s in self.sell_cond_members.values():
+            if code in s:
+                return True
+        return False
 
-    # ---------------------------
-    # 실행 플로우
-    # ---------------------------
-    def run(self):
-        # ✅ ActiveX 실패면 바로 종료
-        if self.isNull():
-            print("[END] ActiveX 생성 실패로 종료")
-            return
 
-        # ✅ 로그인 (두번째 코드 방식)
+    def _orphan_sweeper_tick(self):
+        try:
+            now = time.time()
+            if not self.holdings_qty:
+                return
+
+
+            for code, qty in list(self.holdings_qty.items()):
+                if qty <= 0:
+                    self.orphan_first_seen.pop(code, None)
+                    continue
+                if code in self.pending_codes:
+                    continue
+                if self._is_in_any_sell_condition(code):
+                    self.orphan_first_seen.pop(code, None)
+                    continue
+
+
+                first = self.orphan_first_seen.get(code)
+                if first is None:
+                    self.orphan_first_seen[code] = now
+                    continue
+                if (now - first) >= float(ORPHAN_GRACE_SEC):
+                    self._request_sell_all(code, reason="ORPHAN_SWEEPER")
+                    self.orphan_first_seen[code] = now + 999999
+
+
+        except Exception as e:
+            self._log("ERROR", f"[ORPHAN] sweeper error: {e}", key="ORPHAN_ERR", throttle=5.0)
+
+
+    # -----------------------
+    # Periodic Sync
+    # -----------------------
+    def _periodic_sync_tick(self):
+        self.request_balance()
+        self.request_unfilled()
+        self._promote_sold_today_if_confirmed()
+
+
+    # -----------------------
+    # Run
+    # -----------------------
+    def start(self):
+        self._log("INFO", "[INIT] 프로그램 초기화 시작")
+        self._log("INFO", "[INIT] 프로그램 초기화 완료")
+
+
         self.comm_connect()
-        if not self.account_no:
-            print("[END] 로그인/계좌확인 실패로 종료")
+        if not self.account:
+            self._log("ERROR", "[FATAL] 계좌번호 없음. 종료.")
             return
 
-        # ✅ (44) 팝업/비번 입력 흐름 유도
-        self.show_account_window()
 
-        # 사용자가 입력할 시간을 조금 줌 (너무 길게 잡을 필요는 없음)
+        # ✅ (교체) 아래 코드 방식: 로그인 직후 ShowAccountWindow 호출
+        # - PASSWD="" 인 경우 특히 유용
+        self.show_account_window()
         time.sleep(1.5)
 
-        # 잔고/조건 로드
-        self.request_balance(force=True)
-        self.get_condition_load()
 
-        self.timer_buy.start(300)
-        self.timer_auto_sell.start(AUTO_SELL_INTERVAL_SEC * 1000)
+        self.load_conditions()
+        self.subscribe_conditions()
 
-        QApplication.instance().exec_()
+
+        self.request_balance()
+        self.request_unfilled()
+
+
+        self.buy_timer.start(250)
+        self.delay_sell_timer.start(200)
+        self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
+        self.sync_timer.start(int(max(5, BALANCE_COOLDOWN_SEC) * 1000))
+
+
+        self._log("INFO", "[RUN] 타이머 시작 완료")
+
+
 
 
 def main():
     app = QApplication(sys.argv)
     kiwoom = Kiwoom()
-    kiwoom.run()
+    kiwoom.start()
+    sys.exit(app.exec_())
+
+
 
 
 if __name__ == "__main__":
