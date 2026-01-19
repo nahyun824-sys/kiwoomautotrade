@@ -22,6 +22,17 @@ Kiwoom OpenAPI+ 자동매매 통합본 (단일 파일)
     - opw00018 잔고조회 SetInputValue("비밀번호", PASSWD) 사용
 
 
+✅ (이번 반영)
+12) ✅ delayed_sells 예약이 걸린 종목은 orphan에서 제외 (우선순위: sell-delay > orphan)
+13) ✅ 손절(Stoploss)은 지연매도 하지 않고 즉시 매도
+    - risk_timer 추가(AUTO_SELL_INTERVAL_SEC마다)
+    - holdings 순회 → 현재가 조회 → 수익률 계산 → STOPLOSS_PCT 이하 즉시 매도
+14) ✅ 트레일링 스탑 10% 구현
+    - self.peak_price[code] 추적
+    - 최고가 대비 -10%이면 즉시 매도
+15) ✅ chejan gubun=1에서 qty==0 순간 sold_today 즉시 add + 저장
+
+
 환경: Windows / Python 32-bit / PyQt5 / Kiwoom OpenAPI+
 중요: QAxWidget import = PyQt5.QAxContainer
 """
@@ -41,6 +52,8 @@ from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 
 
+
+
 # =========================
 # 사용자 설정 (여기만 건드리면 됨)
 # =========================
@@ -48,22 +61,26 @@ BUY_COND_NAMES = {"w3", "x2"} # ✅ 매수 조건
 SELL_COND_NAMES = {"w", "w3", "x2"} # ✅ 매도 조건(이탈 트리거 → 지연매도)
 
 
-TARGET_BUY_AMOUNT = 100000 # 1회 매수 예산(분할매수 단위)
-MAX_POSITION_PER_CODE = 100000 # ✅ 종목당 누적 노출(보유+미체결+대기예산) 최대 한도
-ALLOW_ADD_BUY = False  # ✅ 동일 종목 추가매수 허용 여부
+TARGET_BUY_AMOUNT = 150000 # 1회 매수 예산(분할매수 단위)
+MAX_POSITION_PER_CODE = 150000 # ✅ 종목당 누적 노출(보유+미체결+대기예산) 최대 한도
+ALLOW_ADD_BUY = False # ✅ 동일 종목 추가매수 허용 여부
 
 
-SELL_DELAY_SEC = 3.0    # ✅ 조건 이탈 시 지연매도 (우선)
-REBUY_COOLDOWN_SEC = 60.0  # ✅ 매도 직후 임시 재매수 금지(초)
-SOLD_TODAY_PERSIST = True  # ✅ 당일 재매수 금지 저장/로드
+SELL_DELAY_SEC = 5.0 # ✅ 조건 이탈 시 지연매도 (초)
+REBUY_COOLDOWN_SEC = 600.0 # ✅ 매도 직후 임시 재매수 금지(초)
+SOLD_TODAY_PERSIST = True # ✅ 당일 재매수 금지 저장/로드
 
 
-STOPLOSS_PCT = -10.0    # (옵션)
-AUTO_SELL_INTERVAL_SEC = 60 # (옵션)
+STOPLOSS_PCT = -5.0 # ✅ 손절 (즉시 매도)
+AUTO_SELL_INTERVAL_SEC = 60 # ✅ risk_timer 주기(초)
+
+
+TRAILING_STOP_PCT = 10.0 # ✅ 트레일링: 최고점 대비 -10% (즉시 매도)
+TRAILING_ENABLED = True
 
 
 BALANCE_COOLDOWN_SEC = 3.0 # 잔고 TR 과호출 방지
-PRICE_REQ_INTERVAL = 0.25  # 현재가 TR 과호출 방지
+PRICE_REQ_INTERVAL = 0.25 # 현재가 TR 과호출 방지
 PRICE_RETRY_MAX = 3
 PRICE_RETRY_SLEEP = 0.8
 
@@ -74,7 +91,7 @@ ORPHAN_GRACE_SEC = 60
 
 
 # 로그 설정
-LOG_LEVEL = "INFO"  # "DEBUG" / "INFO" / "WARN" / "ERROR"
+LOG_LEVEL = "INFO" # "DEBUG" / "INFO" / "WARN" / "ERROR"
 LOG_TO_FILE = True
 LOG_FILE_PATH = "kiwoomautotrade.log"
 LOG_THROTTLE_SEC = 2.0
@@ -82,8 +99,7 @@ LOG_PRINT_CODELIST_MAX = 8
 
 
 # ✅ (교체) 비밀번호 입력 방식(아래 코드 방식)
-# - 보안상 비추천: 하드코딩하지 말고 PASSWD=""로 두고 ShowAccountWindow에서 입력해도 됨
-PASSWD = ""    # "" 가능
+PASSWD = "" # "" 가능
 PASSWD_MEDIA = "00" # 00: 공통
 
 
@@ -214,6 +230,10 @@ class Kiwoom(QAxWidget):
         self.orphan_first_seen: Dict[str, float] = {}
 
 
+        # ✅ 트레일링 피크 추적
+        self.peak_price: Dict[str, int] = {}
+
+
         # TR 결과 임시
         self._price_resp: Dict[str, int] = {}
         self._last_price_req_ts = 0.0
@@ -241,6 +261,9 @@ class Kiwoom(QAxWidget):
         self._log("INFO", f"[BOOT-CONFIG] TARGET_BUY_AMOUNT={TARGET_BUY_AMOUNT}")
         self._log("INFO", f"[BOOT-CONFIG] MAX_POSITION_PER_CODE={MAX_POSITION_PER_CODE}")
         self._log("INFO", f"[BOOT-CONFIG] ALLOW_ADD_BUY={ALLOW_ADD_BUY}")
+        self._log("INFO", f"[BOOT-CONFIG] SELL_DELAY_SEC={SELL_DELAY_SEC}")
+        self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_PCT={STOPLOSS_PCT} / AUTO_SELL_INTERVAL_SEC={AUTO_SELL_INTERVAL_SEC}")
+        self._log("INFO", f"[BOOT-CONFIG] TRAILING_ENABLED={TRAILING_ENABLED} / TRAILING_STOP_PCT={TRAILING_STOP_PCT}")
         self._log("INFO", f"[BOOT-CONFIG] PASSWD={'(EMPTY)' if PASSWD=='' else '(SET)'} / PASSWD_MEDIA={PASSWD_MEDIA}")
         self._log("INFO", "======================================================================")
 
@@ -264,6 +287,11 @@ class Kiwoom(QAxWidget):
 
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self._periodic_sync_tick)
+
+
+        # ✅ 리스크 타이머(손절/트레일링)
+        self.risk_timer = QTimer()
+        self.risk_timer.timeout.connect(self._risk_monitor_tick)
 
 
     # -----------------------
@@ -306,10 +334,6 @@ class Kiwoom(QAxWidget):
     # ✅ (추가) ShowAccountWindow (아래 코드 방식)
     # -----------------------
     def show_account_window(self):
-        """
-        ✅ KOA_Functions('ShowAccountWindow') 호출
-        - PASSWD를 비워둔 경우에도 사용자 입력창 흐름을 통과하기 위한 용도
-        """
         self._log("INFO", "[UI] KOA_Functions('ShowAccountWindow') 호출(계좌/비번 입력창 유도)", key="SHOW_ACC_WIN", throttle=1.0)
         try:
             ret = self.dynamicCall("KOA_Functions(QString, QString)", "ShowAccountWindow", "")
@@ -373,12 +397,7 @@ class Kiwoom(QAxWidget):
     # -----------------------
     def _tr_request(self, rq_name: str, tr_code: str, screen: str, timeout_sec: float = 8.0) -> bool:
         if self._tr_busy:
-            self._log(
-                "WARN",
-                f"[TR-SERIAL] busy({self._tr_busy_name}) -> skip rq={rq_name}",
-                key=f"TR_BUSY_{rq_name}",
-                throttle=0.5,
-            )
+            self._log("WARN", f"[TR-SERIAL] busy({self._tr_busy_name}) -> skip rq={rq_name}", key=f"TR_BUSY_{rq_name}", throttle=0.5)
             return False
 
 
@@ -389,12 +408,7 @@ class Kiwoom(QAxWidget):
 
         ret = self.dynamicCall("CommRqData(QString, QString, int, QString)", rq_name, tr_code, 0, screen)
         if ret != 0:
-            self._log(
-                "WARN",
-                f"[TR-SERIAL] CommRqData fail ret={ret} rq={rq_name}",
-                key=f"TR_FAIL_{rq_name}",
-                throttle=0.5,
-            )
+            self._log("WARN", f"[TR-SERIAL] CommRqData fail ret={ret} rq={rq_name}", key=f"TR_FAIL_{rq_name}", throttle=0.5)
             self._tr_busy = False
             self._tr_busy_name = ""
             self._tr_deadline = 0.0
@@ -426,12 +440,7 @@ class Kiwoom(QAxWidget):
 
 
         if time.time() >= self._tr_deadline:
-            self._log(
-                "ERROR",
-                f"[TR-SERIAL] timeout rq={self._tr_busy_name} -> force release",
-                key=f"TR_TO_{self._tr_busy_name}",
-                throttle=0.5,
-            )
+            self._log("ERROR", f"[TR-SERIAL] timeout rq={self._tr_busy_name} -> force release", key=f"TR_TO_{self._tr_busy_name}", throttle=0.5)
             self._tr_release()
             if self.tr_loop.isRunning():
                 self.tr_loop.exit()
@@ -533,12 +542,7 @@ class Kiwoom(QAxWidget):
     def _send_condition_retry(self, name: str, idx: int, scr: str, search: int) -> bool:
         for i in range(1, 6):
             ret = self.dynamicCall("SendCondition(QString, QString, int, int)", scr, name, idx, search)
-            self._log(
-                "INFO",
-                f"[COND-SUB] 구독 시도: {name} idx={idx} scr={scr} ret={ret} (try {i}/5)",
-                key=f"COND_SUB_{name}",
-                throttle=0.2,
-            )
+            self._log("INFO", f"[COND-SUB] 구독 시도: {name} idx={idx} scr={scr} ret={ret} (try {i}/5)", key=f"COND_SUB_{name}", throttle=0.2)
             if ret == 1:
                 self._log("INFO", f"[COND-SUB] ✅ 구독 성공: {name}")
                 return True
@@ -558,12 +562,7 @@ class Kiwoom(QAxWidget):
 
         if cond_name in SELL_COND_NAMES:
             self.sell_cond_members[cond_name] = set(map(_norm_code, codes))
-            self._log(
-                "INFO",
-                f"[SELL-COND-INIT] cond={cond_name} -> {self._fmt_codelist(self.sell_cond_members[cond_name])}",
-                key=f"SELLINIT_{cond_name}",
-                throttle=0.5,
-            )
+            self._log("INFO", f"[SELL-COND-INIT] cond={cond_name} -> {self._fmt_codelist(self.sell_cond_members[cond_name])}", key=f"SELLINIT_{cond_name}", throttle=0.5)
 
 
         if cond_name in BUY_COND_NAMES:
@@ -582,12 +581,7 @@ class Kiwoom(QAxWidget):
 
 
         if event_type == "I":
-            self._log(
-                "INFO",
-                f"[COND-REAL] cond={cond_name} 편입(I): {self._code_tag(code)}",
-                key=f"COND_I_{cond_name}_{code}",
-                throttle=0.5,
-            )
+            self._log("INFO", f"[COND-REAL] cond={cond_name} 편입(I): {self._code_tag(code)}", key=f"COND_I_{cond_name}_{code}", throttle=0.5)
             if cond_name in SELL_COND_NAMES:
                 self.sell_cond_members[cond_name].add(code)
             if cond_name in BUY_COND_NAMES:
@@ -595,12 +589,7 @@ class Kiwoom(QAxWidget):
 
 
         elif event_type == "D":
-            self._log(
-                "INFO",
-                f"[COND-REAL] cond={cond_name} 이탈(D): {self._code_tag(code)}",
-                key=f"COND_D_{cond_name}_{code}",
-                throttle=0.5,
-            )
+            self._log("INFO", f"[COND-REAL] cond={cond_name} 이탈(D): {self._code_tag(code)}", key=f"COND_D_{cond_name}_{code}", throttle=0.5)
             if cond_name in SELL_COND_NAMES:
                 self.sell_cond_members[cond_name].discard(code)
                 self._schedule_delayed_sell(code, cond_name, reason="COND_EXIT")
@@ -614,9 +603,7 @@ class Kiwoom(QAxWidget):
 
 
         if rq_name == "opt10001_req":
-            code = _norm_code(
-                self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, 0, "종목코드")
-            )
+            code = _norm_code(self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, 0, "종목코드"))
             price_raw = self.dynamicCall("GetCommData(QString, QString, int, QString)", tr_code, rq_name, 0, "현재가")
             price = abs(_safe_int(price_raw, 0))
             self._price_resp[code] = price
@@ -678,12 +665,7 @@ class Kiwoom(QAxWidget):
                 if price > 0:
                     return price
             else:
-                self._log(
-                    "WARN",
-                    f"[PRICE] TR요청 스킵/실패 attempt={attempt} code={self._code_tag(code)}",
-                    key=f"PRICE_FAIL_{code}",
-                    throttle=0.5,
-                )
+                self._log("WARN", f"[PRICE] TR요청 스킵/실패 attempt={attempt} code={self._code_tag(code)}", key=f"PRICE_FAIL_{code}", throttle=0.5)
             time.sleep(PRICE_RETRY_SLEEP)
 
 
@@ -701,13 +683,8 @@ class Kiwoom(QAxWidget):
 
 
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account)
-
-
-        # ✅ (교체) 아래 코드 방식: PASSWD 사용(빈값 가능)
         self.dynamicCall("SetInputValue(QString, QString)", "비밀번호", PASSWD)
         self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", PASSWD_MEDIA)
-
-
         self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
         self._tr_request("opw00018_req", "opw00018", SCREEN_TR_BAL, timeout_sec=8.0)
 
@@ -724,7 +701,7 @@ class Kiwoom(QAxWidget):
 
 
     # -----------------------
-    # ✅ 잔고/미체결 "변화 있을 때만" 로그를 위한 signature
+    # ✅ 잔고/미체결 signature
     # -----------------------
     def _make_balance_sig(self, qty_map: Dict[str, int], avg_map: Dict[str, int]) -> Tuple[Tuple[str, int, int], ...]:
         rows = []
@@ -737,14 +714,8 @@ class Kiwoom(QAxWidget):
         rows = []
         for order_no in sorted(unfilled.keys()):
             od = unfilled.get(order_no, {}) or {}
-            rows.append((
-                str(order_no),
-                _norm_code(od.get("code", "")),
-                str(od.get("bs", "")),
-                int(od.get("qty", 0) or 0),
-                int(od.get("unfilled", 0) or 0),
-                int(od.get("price", 0) or 0),
-            ))
+            rows.append((str(order_no), _norm_code(od.get("code", "")), str(od.get("bs", "")),
+                            int(od.get("qty", 0) or 0), int(od.get("unfilled", 0) or 0), int(od.get("price", 0) or 0)))
         return tuple(rows)
 
 
@@ -780,6 +751,12 @@ class Kiwoom(QAxWidget):
         self.holdings_name = new_name
 
 
+        # ✅ 보유 없는 종목은 peak 제거(정리)
+        for code in list(self.peak_price.keys()):
+            if self.holdings_qty.get(code, 0) <= 0:
+                self.peak_price.pop(code, None)
+
+
         for code in list(self.rebuy_block_pending):
             if self.holdings_qty.get(code, 0) <= 0:
                 self.rebuy_block_pending.discard(code)
@@ -789,20 +766,11 @@ class Kiwoom(QAxWidget):
             return
 
 
-        self._log(
-            "INFO",
-            f"[BALANCE] 변경감지: 보유종목({len(self.holdings_qty)}): "
-            + "{%s}"
-            % ", ".join(
-                [
-                    f"{self._code_tag(c)}={q}"
-                    for c, q in list(self.holdings_qty.items())[:12]
-                ]
-            )
-            + (" ..." if len(self.holdings_qty) > 12 else ""),
-            key="BAL_CHANGED",
-            throttle=0.0,
-        )
+        self._log("INFO",
+                    f"[BALANCE] 변경감지: 보유종목({len(self.holdings_qty)}): "
+                    + "{%s}" % ", ".join([f"{self._code_tag(c)}={q}" for c, q in list(self.holdings_qty.items())[:12]])
+                    + (" ..." if len(self.holdings_qty) > 12 else ""),
+                    key="BAL_CHANGED", throttle=0.0)
 
 
     def _parse_unfilled(self, tr_code, rq_name):
@@ -840,17 +808,10 @@ class Kiwoom(QAxWidget):
         sample = []
         for order_no in list(sorted(self.unfilled_orders.keys()))[:8]:
             od = self.unfilled_orders[order_no]
-            sample.append(
-                f"{order_no}:{self._code_tag(od.get('code'))}/{od.get('bs')}/미체결{od.get('unfilled')}"
-            )
+            sample.append(f"{order_no}:{self._code_tag(od.get('code'))}/{od.get('bs')}/미체결{od.get('unfilled')}")
         sample_txt = ", ".join(sample)
         more = "" if len(self.unfilled_orders) <= 8 else f" ... (+{len(self.unfilled_orders) - 8})"
-        self._log(
-            "INFO",
-            f"[UNFILLED] 변경감지: 미체결 {len(self.unfilled_orders)}건 | {sample_txt}{more}",
-            key="UNF_CHANGED",
-            throttle=0.0,
-        )
+        self._log("INFO", f"[UNFILLED] 변경감지: 미체결 {len(self.unfilled_orders)}건 | {sample_txt}{more}", key="UNF_CHANGED", throttle=0.0)
 
 
     # -----------------------
@@ -900,11 +861,27 @@ class Kiwoom(QAxWidget):
                     self.holdings_name[code] = name
                     if name:
                         self.code_name_cache[code] = name
+                    # ✅ 신규/갱신 보유 시 peak 초기값이 없으면 현재 평단 기반 초기화(리스크틱에서 현재가로 갱신됨)
+                    if code not in self.peak_price:
+                        base = avg if avg > 0 else 0
+                        if base > 0:
+                            self.peak_price[code] = base
                 else:
+                    # ✅ qty==0 확정
                     self.holdings_qty.pop(code, None)
                     self.holdings_avg.pop(code, None)
                     self.holdings_name.pop(code, None)
                     self.rebuy_block_pending.discard(code)
+                    self.peak_price.pop(code, None)
+
+
+                    # ✅ (요청) qty==0 순간 sold_today 즉시 등록/저장
+                    if code and (code not in self.sold_today):
+                        self.sold_today.add(code)
+                        self._log("INFO", f"[SOLD-TODAY] ✅ 체잔 qty=0 확정 -> 당일 재매수 금지 등록: {self._code_tag(code)}",
+                                    key=f"SOLD_TODAY_ADD_{code}", throttle=0.0)
+                        if SOLD_TODAY_PERSIST:
+                            self._save_sold_today()
 
 
                 try:
@@ -1062,6 +1039,30 @@ class Kiwoom(QAxWidget):
                     key=f"SELL_SCHED_{code}_{cond}", throttle=0.2)
 
 
+    def _has_any_delayed_sell(self, code: str) -> bool:
+        code = _norm_code(code)
+        if not code:
+            return False
+        for (c, _cond) in self.delayed_sells.keys():
+            if c == code:
+                return True
+        return False
+
+
+    def _clear_delayed_sells_code(self, code: str):
+        code = _norm_code(code)
+        if not code:
+            return
+        removed = 0
+        for k in list(self.delayed_sells.keys()):
+            if k[0] == code:
+                self.delayed_sells.pop(k, None)
+                removed += 1
+        if removed > 0:
+            self._log("INFO", f"[SELL-DELAY] 정리: {self._code_tag(code)} 관련 예약 {removed}건 삭제(즉시매도 우선)",
+                        key=f"SELL_DELAY_CLR_{code}", throttle=0.0)
+
+
     def _process_delayed_sells_tick(self):
         now = time.time()
         keys = list(self.delayed_sells.keys())
@@ -1071,8 +1072,12 @@ class Kiwoom(QAxWidget):
                 continue
 
 
+            # 만기 도달
             if cond in SELL_COND_NAMES and code in self.sell_cond_members.get(cond, set()):
+                # 만기 시점에 재편입이면 취소
                 self.delayed_sells.pop((code, cond), None)
+                self._log("INFO", f"[SELL-DELAY] 만기취소: {self._code_tag(code)} cond={cond} (re-entered)",
+                            key=f"SELL_DELAY_CANCEL_{code}_{cond}", throttle=0.2)
                 continue
 
 
@@ -1081,8 +1086,12 @@ class Kiwoom(QAxWidget):
 
             hold_qty = self.holdings_qty.get(code, 0)
             if hold_qty <= 0:
+                self._log("INFO", f"[SELL-DELAY] 만기스킵: {self._code_tag(code)} cond={cond} (no holding)",
+                            key=f"SELL_DELAY_SKIP_NOHOLD_{code}_{cond}", throttle=0.2)
                 continue
             if code in self.pending_codes:
+                self._log("INFO", f"[SELL-DELAY] 만기스킵: {self._code_tag(code)} cond={cond} (pending_codes)",
+                            key=f"SELL_DELAY_SKIP_PEND_{code}_{cond}", throttle=0.2)
                 continue
 
 
@@ -1122,10 +1131,12 @@ class Kiwoom(QAxWidget):
 
 
     def _promote_sold_today_if_confirmed(self):
+        # (유지) 백업성 로직: 체잔 누락 대비
         for code, until in list(self.rebuy_block_until.items()):
             if self.holdings_qty.get(code, 0) <= 0 and code not in self.rebuy_block_pending:
                 if code not in self.sold_today:
                     self.sold_today.add(code)
+                    self._log("INFO", f"[SOLD-TODAY] ✅ 승격(backup): {self._code_tag(code)}", key=f"SOLD_PROMOTE_{code}", throttle=0.0)
                     if SOLD_TODAY_PERSIST:
                         self._save_sold_today()
 
@@ -1178,8 +1189,18 @@ class Kiwoom(QAxWidget):
                 if qty <= 0:
                     self.orphan_first_seen.pop(code, None)
                     continue
+
+
                 if code in self.pending_codes:
                     continue
+
+
+                # ✅ (요청 1) delayed_sells 예약이 걸린 종목은 orphan 제외 (sell-delay > orphan)
+                if self._has_any_delayed_sell(code):
+                    self.orphan_first_seen.pop(code, None)
+                    continue
+
+
                 if self._is_in_any_sell_condition(code):
                     self.orphan_first_seen.pop(code, None)
                     continue
@@ -1196,6 +1217,80 @@ class Kiwoom(QAxWidget):
 
         except Exception as e:
             self._log("ERROR", f"[ORPHAN] sweeper error: {e}", key="ORPHAN_ERR", throttle=5.0)
+
+
+    # -----------------------
+    # ✅ Risk Monitor (Stoploss / Trailing)
+    # -----------------------
+    def _risk_monitor_tick(self):
+        try:
+            if not self.holdings_qty:
+                return
+
+
+            # 너무 잦은 로그 방지(핵심 이벤트만 INFO)
+            for code, qty in list(self.holdings_qty.items()):
+                if qty <= 0:
+                    continue
+
+
+                avg = int(self.holdings_avg.get(code, 0) or 0)
+                if avg <= 0:
+                    continue
+
+
+                # (의사결정 A 기본) pending이면 중복 주문 방지 위해 스킵
+                if code in self.pending_codes:
+                    continue
+
+
+                cur = self.request_price(code)
+                if not cur or cur <= 0:
+                    continue
+
+
+                # peak 갱신
+                if TRAILING_ENABLED:
+                    peak = int(self.peak_price.get(code, 0) or 0)
+                    if peak <= 0:
+                        self.peak_price[code] = cur
+                        peak = cur
+                    elif cur > peak:
+                        self.peak_price[code] = cur
+                        peak = cur
+
+
+                # 수익률 계산(평단 기준)
+                pnl_pct = (float(cur - avg) / float(avg)) * 100.0
+
+
+                # 1) STOPLOSS (즉시)
+                if STOPLOSS_PCT is not None and float(pnl_pct) <= float(STOPLOSS_PCT):
+                    self._log("INFO",
+                                f"[RISK] STOPLOSS 발동: {self._code_tag(code)} cur={cur} avg={avg} pnl={pnl_pct:.2f}%",
+                                key=f"STOPLOSS_FIRE_{code}", throttle=0.0)
+                    # 즉시매도가 우선: 지연매도 예약 정리
+                    self._clear_delayed_sells_code(code)
+                    self._request_sell_all(code, reason="STOPLOSS")
+                    continue
+
+
+                # 2) TRAILING (즉시)
+                if TRAILING_ENABLED:
+                    peak = int(self.peak_price.get(code, 0) or 0)
+                    if peak > 0:
+                        drawdown_pct = (float(cur - peak) / float(peak)) * 100.0
+                        if drawdown_pct <= -abs(float(TRAILING_STOP_PCT)):
+                            self._log("INFO",
+                                        f"[RISK] TRAILING 발동: {self._code_tag(code)} cur={cur} peak={peak} dd={drawdown_pct:.2f}%",
+                                        key=f"TRAIL_FIRE_{code}", throttle=0.0)
+                            self._clear_delayed_sells_code(code)
+                            self._request_sell_all(code, reason=f"TRAILING_{TRAILING_STOP_PCT:.0f}")
+                            continue
+
+
+        except Exception as e:
+            self._log("ERROR", f"[RISK] monitor error: {e}", key="RISK_ERR", throttle=5.0)
 
 
     # -----------------------
@@ -1221,8 +1316,6 @@ class Kiwoom(QAxWidget):
             return
 
 
-        # ✅ (교체) 아래 코드 방식: 로그인 직후 ShowAccountWindow 호출
-        # - PASSWD="" 인 경우 특히 유용
         self.show_account_window()
         time.sleep(1.5)
 
@@ -1239,6 +1332,10 @@ class Kiwoom(QAxWidget):
         self.delay_sell_timer.start(200)
         self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
         self.sync_timer.start(int(max(5, BALANCE_COOLDOWN_SEC) * 1000))
+
+
+        # ✅ risk_timer 시작
+        self.risk_timer.start(int(max(5, int(AUTO_SELL_INTERVAL_SEC)) * 1000))
 
 
         self._log("INFO", "[RUN] 타이머 시작 완료")
