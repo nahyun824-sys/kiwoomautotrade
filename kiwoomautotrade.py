@@ -13,8 +13,10 @@ B안 핵심
 3) 숫자 파서 강화(_safe_int): <a href="tel:...">..</a>, 콤마, 공백 등 처리
 
 ⚠️ 이번 수정(최소침습)
-- 들여쓰기/스코프 깨져서 Kiwoom 메서드들이 전역/중첩 함수로 튀어나간 문제 복구
-- stoploss_base_qty 누락 초기화 추가
+- (A) 주문 거부/사유 MSG를 INFO로도 출력
+- (B) 체잔(gubun=0)에서 주문상태(913)/거부사유(919) 로그 + 리포트
+- (C) SendOrder ret=0은 "주문요청 성공"으로만 표기(체결 성공 착시 제거)
+20260225
 """
 
 import sys
@@ -34,8 +36,8 @@ from PyQt5.QtCore import QEventLoop, QTimer
 # =========================
 # 사용자 설정
 # =========================
-BUY_COND_NAMES = {"w3", "x2"}
-SELL_COND_NAMES = {"w", "w3", "x2"}
+BUY_COND_NAMES = {"w3"}
+SELL_COND_NAMES = {"w", "w3"}
 
 TARGET_BUY_AMOUNT = 150000
 MAX_POSITION_PER_CODE = 150000
@@ -44,7 +46,7 @@ ALLOW_ADD_BUY = False
 SELL_DELAY_SEC = 5.0
 REBUY_COOLDOWN_SEC = 600.0
 
-STOPLOSS_TIERS = [(-3.0, 0.50), (-5.0, 0.50), (-7.0, 1.00)]
+STOPLOSS_TIERS = [(-2.5, 0.50), (-3.0, 0.50), (-4.0, 1.00)]
 AUTO_SELL_INTERVAL_SEC = 60
 
 TRAILING_STOP_PCT = 10.0
@@ -84,6 +86,16 @@ SOLD_TODAY_FILE = "sold_today.json"
 
 BOUGHT_TODAY_PERSIST = True
 BOUGHT_TODAY_FILE = "bought_today.json"
+
+# === 거래 시간 게이트 (KST) ===
+# 프로그램을 언제 실행하든 상관없이 아래 시간대에만 자동매매(조건/주문/리스크/오펀)가 동작합니다.
+TRADE_WINDOW_ENABLED = True
+TRADE_START_HHMM = "0850"
+TRADE_END_HHMM   = "2000"  # end is exclusive
+
+# 창 밖에서는 완전 종료할지(앱 종료), 아니면 대기만 할지
+EXIT_AFTER_WINDOW = False
+
 
 
 def _today_yyyymmdd() -> str:
@@ -271,6 +283,10 @@ class Kiwoom(QAxWidget):
         # buy queue
         self.buy_queue = deque()
         self.buy_queue_set: Set[str] = set()
+        # 마지막 미매수(=매수 시도 실패/차단) 사유 기록
+        # - 조건 편입(I) 로그와 함께 '왜 미매수였는지' 추적하기 위함
+        self.last_buy_block_reason: Dict[str, str] = {}  # code -> reason
+        self.last_buy_block_ts: Dict[str, float] = {}    # code -> time.time()
 
         # delayed sells
         self.delayed_sells: Dict[Tuple[str, str], float] = {}
@@ -288,7 +304,8 @@ class Kiwoom(QAxWidget):
         # risk
         self.peak_price: Dict[str, int] = {}
         self.stoploss_stage: Dict[str, int] = defaultdict(int)
-        self.stoploss_base_qty: Dict[str, int] = defaultdict(int)  # ✅ 누락 초기화
+        self.stoploss_base_qty: Dict[str, int] = defaultdict(int)
+
         self._risk_running = False
 
         # caching / price
@@ -380,6 +397,13 @@ class Kiwoom(QAxWidget):
         self.risk_timer = QTimer()
         self.risk_timer.timeout.connect(self._risk_monitor_tick)
 
+        # trade window guard
+        self._trade_window_last: Optional[bool] = None
+        self.trade_window_timer = QTimer()
+        self.trade_window_timer.timeout.connect(self._trade_window_guard_tick)
+        self.trade_window_timer.start(1000)  # 1초마다 거래창 상태 감시
+
+
     # -----------------------
     # Logger
     # -----------------------
@@ -454,6 +478,93 @@ class Kiwoom(QAxWidget):
         return f"{n} codes: {head}{more}"
 
     # -----------------------
+    # Trade window gate (KST)
+    # -----------------------
+    def _in_trade_window(self, now: datetime.datetime = None) -> bool:
+        if not TRADE_WINDOW_ENABLED:
+            return True
+        if now is None:
+            now = datetime.datetime.now()
+        hhmm = now.strftime('%H%M')
+        return (TRADE_START_HHMM <= hhmm < TRADE_END_HHMM)
+
+    def _start_trade_session(self):
+        """거래창 진입 시: 조건구독/동기화/타이머 시작"""
+        try:
+            self.subscribe_conditions()
+        except Exception as e:
+            self._log('WARN', f'[TRADE-WINDOW] subscribe_conditions error: {e}', key='TW_SUB_ERR', throttle=2.0)
+
+        try:
+            self.request_balance()
+            self.request_unfilled()
+        except Exception as e:
+            self._log('WARN', f'[TRADE-WINDOW] initial sync error: {e}', key='TW_SYNC_ERR', throttle=2.0)
+
+        self.buy_timer.start(250)
+        self.delay_sell_timer.start(200)
+        self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
+        self.sync_timer.start(int(max(5, float(SYNC_INTERVAL_SEC)) * 1000))
+        self.risk_timer.start(int(max(5, int(AUTO_SELL_INTERVAL_SEC)) * 1000))
+        self.price_queue_timer.start(150)
+
+    def _stop_all_conditions(self):
+        """조건식 실시간 구독 중지"""
+        for name in list(self.subscribed_conds):
+            try:
+                idx = int(self.cond_name_to_idx.get(name, -1))
+                if idx < 0:
+                    continue
+                scr = str(SCREEN_COND_BASE + idx)
+                self.dynamicCall('SendConditionStop(QString, QString, int)', scr, name, idx)
+            except Exception:
+                pass
+        self.subscribed_conds.clear()
+
+    def _stop_trade_session(self):
+        """거래창 이탈 시: 주문/리스크 관련 타이머 정지 + 큐/예약 정리 + 조건중지"""
+        try:
+            self.buy_timer.stop()
+            self.delay_sell_timer.stop()
+            self.orphan_timer.stop()
+            self.sync_timer.stop()
+            self.risk_timer.stop()
+            self.price_queue_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            self.buy_queue.clear()
+            self.buy_queue_set.clear()
+            self.delayed_sells.clear()
+        except Exception:
+            pass
+
+        self._stop_all_conditions()
+
+    def _trade_window_guard_tick(self):
+        inwin = self._in_trade_window()
+        if self._trade_window_last is None:
+            self._trade_window_last = inwin
+            return
+
+        if inwin == self._trade_window_last:
+            return
+
+        self._trade_window_last = inwin
+        if inwin:
+            self._log('INFO', f'[TRADE-WINDOW] ✅ 거래창 진입: {TRADE_START_HHMM}-{TRADE_END_HHMM} -> 자동매매 ON', key='TW_ON', throttle=0.0)
+            self.report.emit('TRADE_WINDOW_ON', {'start': TRADE_START_HHMM, 'end': TRADE_END_HHMM})
+            self._start_trade_session()
+        else:
+            self._log('INFO', f'[TRADE-WINDOW] ⛔ 거래창 종료: {TRADE_START_HHMM}-{TRADE_END_HHMM} -> 자동매매 OFF', key='TW_OFF', throttle=0.0)
+            self.report.emit('TRADE_WINDOW_OFF', {'start': TRADE_START_HHMM, 'end': TRADE_END_HHMM})
+            self._stop_trade_session()
+            if EXIT_AFTER_WINDOW:
+                self._log('INFO', '[TRADE-WINDOW] EXIT_AFTER_WINDOW=True 이므로 프로그램 종료', key='TW_EXIT', throttle=0.0)
+                QApplication.instance().quit()
+
+    # -----------------------
     # Price queue helpers (TR busy 시 다음 tick 처리)
     # -----------------------
     def _enqueue_price_request(self, code: str, why: str = ""):
@@ -509,6 +620,8 @@ class Kiwoom(QAxWidget):
         return None
 
     def _process_price_queue_tick(self):
+        if not self._in_trade_window():
+            return
         if self._risk_running or self._tr_busy:
             return
         if not self.price_req_queue:
@@ -710,12 +823,17 @@ class Kiwoom(QAxWidget):
 
         if cond_name in BUY_COND_NAMES:
             for c in codes:
-                self._enqueue_buy(_norm_code(c), cond_name, ev="INITIAL_TRCOND")
-
+                queued, reason = self._enqueue_buy(_norm_code(c), cond_name, ev="INITIAL_TRCOND")
+                if not queued:
+                    cc = _norm_code(c)
+                    self._log("INFO", f"[COND-INIT] 미매수(큐 등록 실패): {self._code_tag(cc)} cond={cond_name} reason={reason}",
+                              key=f"COND_INIT_NOBUY_{cond_name}_{cc}", throttle=0.5)
+                    self.report.emit("COND_INIT_NOBUY", {"cond": cond_name, "code": cc, "reason": reason})
     def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
         code = _norm_code(code)
         cond_name = str(cond_name)
         event_type = str(event_type)
+        self._log("INFO", f"[COND-REAL-ENTRY] code={code} type={event_type} cond={cond_name} idx={cond_index}", key=f"COND_ENTRY_{cond_name}_{code}_{event_type}", throttle=0.2)
         if not code:
             return
 
@@ -725,7 +843,10 @@ class Kiwoom(QAxWidget):
             if cond_name in SELL_COND_NAMES:
                 self.sell_cond_members[cond_name].add(code)
             if cond_name in BUY_COND_NAMES:
-                self._enqueue_buy(code, cond_name, ev="REAL_I")
+                queued, reason = self._enqueue_buy(code, cond_name, ev="REAL_I")
+                if not queued:
+                    self._log("INFO", f"[COND-REAL] 미매수(큐 등록 실패): {self._code_tag(_norm_code(code))} reason={reason}", key=f"COND_I_NOBUY_{cond_name}_{code}", throttle=0.5)
+                    self.report.emit("COND_REAL_I_NOBUY", {"cond": cond_name, "code": _norm_code(code), "reason": reason})
 
         elif event_type == "D":
             self._log("INFO", f"[COND-REAL] cond={cond_name} 이탈(D): {self._code_tag(code)}", key=f"COND_D_{cond_name}_{code}", throttle=0.5)
@@ -761,9 +882,15 @@ class Kiwoom(QAxWidget):
                 self.tr_loop.exit()
             return
 
+        # ✅ 잔고 연속조회 (여기서 끊김)
+        if rq_name == "opw00018_req":
+            pass # 잘린 부분을 채우거나 이어서 작성하세요
+
         # ✅ 잔고 연속조회
         if rq_name == "opw00018_req":
             self._parse_balance_page(tr_code, rq_name, is_first=not self._bal_is_accumulating)
+
+            self._log("INFO", f"[HOLDINGS-UPDATE] opw00018 page_parsed prev_next={prev_next} tmp_count={len(self._bal_tmp_qty)}", key="HOLD_UPD", throttle=0.2)
 
             if prev_next == "2":
                 self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account)
@@ -820,8 +947,11 @@ class Kiwoom(QAxWidget):
         if self.tr_loop.isRunning():
             self.tr_loop.exit()
 
+    # ✅ (A) 주문 거부/사유 MSG를 INFO로도 출력
     def _on_receive_msg(self, scr_no, rq_name, tr_code, msg):
-        self._log("DEBUG", f"[MSG] scr={scr_no} rq={rq_name} tr={tr_code} msg={msg}", key="MSG", throttle=1.0)
+        self._log("INFO", f"[MSG] scr={scr_no} rq={rq_name} tr={tr_code} msg={msg}",
+                  key="MSG_INFO", throttle=0.0)
+        self.report.emit("MSG", {"scr": str(scr_no), "rq": str(rq_name), "tr": str(tr_code), "msg": str(msg)})
 
     # -----------------------
     # TR Request
@@ -1013,6 +1143,28 @@ class Kiwoom(QAxWidget):
             unfilled = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 902), 0))
             qty = abs(_safe_int(self.dynamicCall("GetChejanData(int)", 900), 0))
 
+            # ✅ (B) 주문상태/거부사유를 반드시 로깅
+            status = str(self.dynamicCall("GetChejanData(int)", 913)).strip()  # 주문상태
+            reject = str(self.dynamicCall("GetChejanData(int)", 919)).strip()  # 거부사유(있을 때만)
+
+            if order_no and code:
+                self._log(
+                    "INFO",
+                    f"[CHEJAN-ORDER] no={order_no} {self._code_tag(code)} bs={bs} status={status} "
+                    f"qty={qty} unfilled={unfilled} reject='{reject}'",
+                    key=f"CH0_{order_no}",
+                    throttle=0.0
+                )
+                self.report.emit("CHEJAN_ORDER_DETAIL", {
+                    "order_no": order_no,
+                    "code": code,
+                    "bs": bs,
+                    "status": status,
+                    "reject": reject,
+                    "qty": qty,
+                    "unfilled": unfilled,
+                })
+
             if order_no and code:
                 if unfilled > 0:
                     self.unfilled_orders[order_no] = {"code": code, "bs": bs, "qty": qty, "unfilled": unfilled, "price": 0}
@@ -1086,24 +1238,63 @@ class Kiwoom(QAxWidget):
     # -----------------------
     # Buy / Sell core
     # -----------------------
-    def _enqueue_buy(self, code: str, cond_name: str, ev: str = ""):
+    def _set_buy_block_reason(self, code: str, reason: str):
+        """미매수(매수 차단/실패) 사유를 최근값으로 저장."""
+        try:
+            if not code:
+                return
+            self.last_buy_block_reason[code] = str(reason) if reason else ""
+            self.last_buy_block_ts[code] = time.time()
+        except Exception:
+            pass
+
+    def _get_buy_block_reason(self, code: str) -> str:
+        try:
+            return self.last_buy_block_reason.get(code, "")
+        except Exception:
+            return ""
+
+    def _enqueue_buy(self, code: str, cond_name: str, ev: str = "") -> Tuple[bool, str]:
+        """매수 큐에 등록. (queued, reason) 반환"""
+        if not self._in_trade_window():
+            reason = "OUT_OF_TRADE_WINDOW"
+            code_n = _norm_code(code)
+            if code_n:
+                self._set_buy_block_reason(code_n, reason)
+            self._log("INFO", f"[BUY-QUEUE] 스킵: 거래창 밖 -> {self._code_tag(code_n)} cond={cond_name} ev={ev} reason={reason}", key=f"BUYQ_BLOCK_WIN_{code_n}", throttle=0.5)
+            self.report.emit("BUYQ_BLOCK_OUT_OF_WINDOW", {"code": code_n, "cond": cond_name, "ev": ev, "reason": reason})
+            return False, reason
         code = _norm_code(code)
         if not code:
-            return
+            self._log("INFO", f"[BUY-QUEUE] 스킵: 빈 종목코드 cond={cond_name} ev={ev}", key="BUYQ_EMPTY", throttle=1.0)
+            self.report.emit("BUYQ_BLOCK_EMPTY_CODE", {"cond": cond_name, "ev": ev})
+            return False, "EMPTY_CODE"
         if code in self.buy_queue_set:
-            return
+            reason = "ALREADY_QUEUED"
+            self._set_buy_block_reason(code, reason)
+            self._log("INFO", f"[BUY-QUEUE] 스킵: 이미 큐에 있음 -> {self._code_tag(code)} cond={cond_name} ev={ev} reason={reason}", key=f"BUYQ_ALREADY_{code}", throttle=0.5)
+            self.report.emit("BUYQ_BLOCK_ALREADY_QUEUED", {"code": code, "cond": cond_name, "ev": ev, "reason": reason})
+            return False, reason
         if code in self.sold_today:
-            self._log("INFO", f"[BUY-QUEUE] 스킵: 재매수 금지 -> {self._code_tag(code)}", key=f"BUYQ_SOLD_{code}", throttle=1.0)
+            reason = "SOLD_TODAY_REBUY_BLOCK"
+            self._set_buy_block_reason(code, reason)
+            self._log("INFO", f"[BUY-QUEUE] 스킵: 재매수 금지 -> {self._code_tag(code)} cond={cond_name} ev={ev} reason={reason}", key=f"BUYQ_SOLD_{code}", throttle=1.0)
             self.report.emit("BUYQ_SKIP_SOLD_TODAY", {"code": code, "cond": cond_name, "ev": ev})
-            return
+            return False, reason
         self.buy_queue.append((code, cond_name, time.time()))
         self.buy_queue_set.add(code)
         self._log("INFO", f"[BUY-QUEUE] 추가: {self._code_tag(code)} cond={cond_name} queue_len={len(self.buy_queue)}",
                   key="BUYQ_ADD", throttle=0.2)
         self.report.emit("BUYQ_ADD", {"code": code, "cond": cond_name, "ev": ev, "queue_len": len(self.buy_queue)})
-
+        return True, "QUEUED"
     def _send_order(self, name: str, screen: str, acc: str, order_type: int,
                     code: str, qty: int, price: int, hoga: str, org_order_no: str) -> int:
+        
+        # 장중(거래 시간) 여부 확인
+        if not self._in_trade_window():
+            self._log('INFO', f"[TRADE-WINDOW] 주문차단(창 밖): name={name} type={order_type} code={self._code_tag(code)} qty={qty}", key=f"TW_BLOCK_{code}", throttle=0.5)
+            return -999
+            
         sig = "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)"
         args = [name, screen, acc, int(order_type), code, int(qty), int(price), hoga, org_order_no]
         return self.dynamicCall(sig, args)
@@ -1165,12 +1356,18 @@ class Kiwoom(QAxWidget):
         return True, "OK"
 
     def _process_buy_queue_tick(self):
+        if not self._in_trade_window():
+            return
         if not self.buy_queue:
             return
         if self._risk_running:
             return
 
         code, cond, ts = self.buy_queue.popleft()
+        self._log("INFO", f"[BUY-ENTRY] code={code} cond={cond} queue_ts={ts:.0f}", key=f"BUY_ENTRY_{code}", throttle=0.2)
+        prev_reason = self._get_buy_block_reason(code)
+        if prev_reason:
+            self._log("INFO", f"[BUY-ENTRY] 최근 미매수 사유: {self._code_tag(code)} reason={prev_reason}", key=f"BUY_ENTRY_REASON_{code}", throttle=0.5)
         self.buy_queue_set.discard(code)
 
         self._log("INFO", f"[BUY] 진입: target={self._code_tag(code)} budget={TARGET_BUY_AMOUNT} cond={cond}",
@@ -1178,18 +1375,22 @@ class Kiwoom(QAxWidget):
 
         price = self.request_price(code)
         if not price:
-            self._log("WARN", f"[BUY] 현재가 실패 -> 스킵: {self._code_tag(code)}", key=f"BUY_NOPRICE_{code}", throttle=1.0)
+            self._set_buy_block_reason(code, "NO_PRICE")
+            self._log("WARN", f"[BUY] 현재가 실패 -> 스킵: {self._code_tag(code)} cond={cond}", key=f"BUY_NOPRICE_{code}", throttle=1.0)
             self.report.emit("BUY_SKIP_NO_PRICE", {"code": code, "cond": cond})
             return
 
         ok, reason = self._can_buy_code(code, price)
         if not ok:
-            self._log("INFO", f"[BUY] 스킵: {self._code_tag(code)} reason={reason}", key=f"BUY_BLOCK_{code}", throttle=0.5)
+            self._set_buy_block_reason(code, reason)
+            self._log("INFO", f"[BUY] 스킵: {self._code_tag(code)} cond={cond} reason={reason}", key=f"BUY_BLOCK_{code}", throttle=0.5)
             self.report.emit("BUY_BLOCK", {"code": code, "cond": cond, "reason": reason, "price": price})
             return
 
         qty = TARGET_BUY_AMOUNT // price
         if qty <= 0:
+            self._set_buy_block_reason(code, "QTY_ZERO")
+            self._log("INFO", f"[BUY] 스킵: 수량=0 -> {self._code_tag(code)} cond={cond} price={price} budget={TARGET_BUY_AMOUNT}", key=f"BUY_QTY0_{code}", throttle=1.0)
             self.report.emit("BUY_SKIP_QTY0", {"code": code, "cond": cond, "price": price})
             return
 
@@ -1201,31 +1402,41 @@ class Kiwoom(QAxWidget):
 
         ret = self._send_order("BUY", "0101", self.account, 1, code, qty, 0, "03", "")
         if ret == 0:
-            self._log("INFO", f"[BUY] ✅ 주문성공: {self._code_tag(code)} qty={qty}", key=f"BUY_OK_{code}", throttle=0.2)
+            # ✅ (C) ret=0은 "주문요청 전송 성공"일 뿐. 체결/접수는 체잔으로 확인.
+            self._log(
+                "INFO",
+                f"[BUY] ✅ 주문요청 성공(SendOrder ret=0): {self._code_tag(code)} qty={qty} cond={cond}",
+                key=f"BUY_SENT_{code}",
+                throttle=0.0,
+            )
+            self._set_buy_block_reason(code, "")  # 성공 시 최근 미매수 사유 초기화
             self.pending_codes.add(code)
 
             self.reserved_exposure[code] += int(order_amount)
             self._log("INFO", f"[BUY-LIMIT] reserved_exposure += {order_amount} -> now={self.reserved_exposure[code]} for {self._code_tag(code)}",
                       key=f"RESERVE_ADD_{code}", throttle=0.0)
 
-            self.report.emit("BUY_OK", {"code": code, "cond": cond, "qty": qty, "price": price, "order_amount": order_amount,
-                                        "reserved_exposure": int(self.reserved_exposure.get(code, 0) or 0)})
+            self.report.emit("BUY_SENT", {"code": code, "cond": cond, "qty": qty, "price": price, "order_amount": order_amount,
+                                          "reserved_exposure": int(self.reserved_exposure.get(code, 0) or 0)})
 
             if code not in self.bought_today:
                 self.bought_today.add(code)
-                self._log("INFO", f"[BOUGHT-TODAY] ✅ 주문성공 선등록(체잔 전): {self._code_tag(code)}",
+                self._log("INFO", f"[BOUGHT-TODAY] ✅ 주문요청 선등록(체잔 전): {self._code_tag(code)}",
                           key=f"BOUGHT_PRE_{code}", throttle=0.0)
                 if BOUGHT_TODAY_PERSIST:
                     self._save_bought_today()
-                self.report.emit("BOUGHT_TODAY_ADD", {"code": code, "via": "BUY_OK_PRE_CHEJAN"})
+                self.report.emit("BOUGHT_TODAY_ADD", {"code": code, "via": "BUY_SENT_PRE_CHEJAN"})
         else:
-            self._log("WARN", f"[BUY] ❌ 주문실패: {self._code_tag(code)} ret={ret}", key=f"BUY_FAIL_{code}", throttle=1.0)
+            self._log("WARN", f"[BUY] ❌ 주문실패: {self._code_tag(code)} cond={cond} ret={ret}", key=f"BUY_FAIL_{code}", throttle=1.0)
+            self._set_buy_block_reason(code, f"ORDER_FAIL_{ret}")
             self.report.emit("BUY_FAIL", {"code": code, "cond": cond, "ret": ret, "price": price, "qty": qty})
 
     # -----------------------
     # Delayed sell / risk / orphan
     # -----------------------
     def _schedule_delayed_sell(self, code: str, cond: str, reason: str):
+        if not self._in_trade_window():
+            return
         code = _norm_code(code)
         if not code:
             return
@@ -1336,6 +1547,8 @@ class Kiwoom(QAxWidget):
             self.report.emit("SELL_DELAY_CLEAR_CODE", {"code": code, "removed": removed})
 
     def _process_delayed_sells_tick(self):
+        if not self._in_trade_window():
+            return
         if self._risk_running:
             return
 
@@ -1371,6 +1584,8 @@ class Kiwoom(QAxWidget):
             self._request_sell_all(code, reason=f"EXIT_{cond}_DELAY{SELL_DELAY_SEC}s")
 
     def _orphan_sweeper_tick(self):
+        if not self._in_trade_window():
+            return
         if self._risk_running:
             return
         try:
@@ -1382,11 +1597,11 @@ class Kiwoom(QAxWidget):
                 if qty <= 0:
                     self.orphan_first_seen.pop(code, None)
                     continue
-                            # ✅ 추가: 당일 매수 종목은 ORPHAN 매도 대상에서 제외
-                if code in self.bought_today:
-                   self.orphan_first_seen.pop(code, None)
-                   continue
 
+                # ✅ 추가: 당일 매수 종목은 ORPHAN 매도 대상에서 제외
+                if code in self.bought_today:
+                    self.orphan_first_seen.pop(code, None)
+                    continue
 
                 if code in self.pending_codes:
                     continue
@@ -1411,6 +1626,8 @@ class Kiwoom(QAxWidget):
             self.report.emit("ORPHAN_ERR", {"err": repr(e)})
 
     def _risk_monitor_tick(self):
+        if not self._in_trade_window():
+            return
         if self._risk_running:
             return
 
@@ -1546,6 +1763,8 @@ class Kiwoom(QAxWidget):
                 self.sync_timer.start(int(max(5, float(SYNC_INTERVAL_SEC)) * 1000))
 
     def _periodic_sync_tick(self):
+        if not self._in_trade_window():
+            return
         if self._risk_running:
             return
         if self._tr_busy:
@@ -1629,20 +1848,28 @@ class Kiwoom(QAxWidget):
         time.sleep(1.5)
 
         self.load_conditions()
-        self.subscribe_conditions()
 
-        self.request_balance()
-        self.request_unfilled()
+        # 거래 시간 게이트: 창 안이면 즉시 구독/타이머 시작, 창 밖이면 대기(guard가 진입 시 시작)
+        if self._in_trade_window():
+            self.subscribe_conditions()
+            self.request_balance()
+            self.request_unfilled()
 
-        self.buy_timer.start(250)
-        self.delay_sell_timer.start(200)
-        self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
-        self.sync_timer.start(int(max(5, float(SYNC_INTERVAL_SEC)) * 1000))
-        self.risk_timer.start(int(max(5, int(AUTO_SELL_INTERVAL_SEC)) * 1000))
-        self.price_queue_timer.start(150)
+            self.buy_timer.start(250)
+            self.delay_sell_timer.start(200)
+            self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
+            self.sync_timer.start(int(max(5, float(SYNC_INTERVAL_SEC)) * 1000))
+            self.risk_timer.start(int(max(5, int(AUTO_SELL_INTERVAL_SEC)) * 1000))
+            self.price_queue_timer.start(150)
 
-        self._log("INFO", "[RUN] 타이머 시작 완료")
-        self.report.emit("RUN_START", {})
+            self._log("INFO", "[RUN] 타이머 시작 완료")
+            self.report.emit("RUN_START", {})
+        else:
+            self._log("INFO", f"[TRADE-WINDOW] 현재 창 밖({TRADE_START_HHMM}-{TRADE_END_HHMM}) -> 자동매매 대기(ON 되면 시작)")
+            self.report.emit("RUN_WAIT_WINDOW", {"start": TRADE_START_HHMM, "end": TRADE_END_HHMM})
+            # 혹시 모를 잔여 구독/타이머 정리
+            self._stop_trade_session()
+
 
 
 def main():
@@ -1660,3 +1887,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
