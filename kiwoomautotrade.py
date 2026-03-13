@@ -36,11 +36,11 @@ from PyQt5.QtCore import QEventLoop, QTimer
 # =========================
 # 사용자 설정
 # =========================
-BUY_COND_NAMES = {"w3"}
-SELL_COND_NAMES = {"w", "w3"}
+BUY_COND_NAMES = {"w3", "A"}
+SELL_COND_NAMES = {"w", "w3", "A"}
 
-TARGET_BUY_AMOUNT = 150000
-MAX_POSITION_PER_CODE = 150000
+TARGET_BUY_AMOUNT = 70000
+MAX_POSITION_PER_CODE = 70000
 ALLOW_ADD_BUY = False
 
 SELL_DELAY_SEC = 5.0
@@ -49,7 +49,7 @@ REBUY_COOLDOWN_SEC = 600.0
 STOPLOSS_TIERS = [(-2.5, 0.50), (-3.0, 0.50), (-4.0, 1.00)]
 AUTO_SELL_INTERVAL_SEC = 60
 
-TRAILING_STOP_PCT = 10.0
+TRAILING_STOP_PCT = 8.0
 TRAILING_ENABLED = True
 
 BALANCE_COOLDOWN_SEC = 3.0
@@ -57,13 +57,23 @@ SYNC_INTERVAL_SEC = 15.0
 PRICE_REQ_INTERVAL = 0.25
 PRICE_RETRY_MAX = 3
 PRICE_RETRY_SLEEP = 0.8
+PRICE_CACHE_HARD_TTL_SEC = 15.0
+ORDER_INTENT_TIMEOUT_SEC = 12.0
+CONDITION_CHATTER_WINDOW_SEC = 15.0
+CONDITION_CHATTER_COUNT = 4
+CONDITION_CHATTER_EXTRA_DELAY_SEC = 2.0
+METRICS_EMIT_INTERVAL_SEC = 60.0
 
 ORPHAN_CHECK_INTERVAL_SEC = 10
 ORPHAN_GRACE_SEC = 60
 
+TODAY = datetime.datetime.now().strftime("%y%m%d")   # 예: 260312
+MONTH = datetime.datetime.now().strftime("%y%m")     # 예: 2603
+
 LOG_LEVEL = "INFO"  # "DEBUG"/"INFO"/"WARN"/"ERROR"
 LOG_TO_FILE = True
-LOG_FILE_PATH = "kiwoomautotrade.log"
+LOG_DIR = "logs"
+LOG_FILE_PATH = f"{LOG_DIR}/{MONTH}/kiwoomautotrade_{TODAY}.log"
 LOG_THROTTLE_SEC = 2.0
 LOG_PRINT_CODELIST_MAX = 8
 
@@ -86,6 +96,17 @@ SOLD_TODAY_FILE = "sold_today.json"
 
 BOUGHT_TODAY_PERSIST = True
 BOUGHT_TODAY_FILE = "bought_today.json"
+# === Holdings snapshot (계좌 보유종목 JSON 저장) ===
+HOLDINGS_SNAPSHOT_ENABLED = True
+HOLDINGS_SNAPSHOT_FILE = "holdings_snapshot.json"
+
+# === Take-profit (부분익절) ===
+# +10% 도달 시 보유수량의 30% (기준수량=시작/신규편입 시점 수량) 익절
+# +15% 도달 시 보유수량의 30% (기준수량의 30%) 추가 익절
+TAKEPROFIT_ENABLED = True
+TAKEPROFIT_LEVELS = [(8.0, 0.30), (15.0, 0.30)]  # (pnl_pct_threshold, sell_ratio_of_base_qty)
+TAKEPROFIT_MIN_QTY = 1
+
 
 # === 거래 시간 게이트 (KST) ===
 # 프로그램을 언제 실행하든 상관없이 아래 시간대에만 자동매매(조건/주문/리스크/오펀)가 동작합니다.
@@ -277,6 +298,20 @@ class Kiwoom(QAxWidget):
         self.unfilled_orders: Dict[str, Dict[str, Any]] = {}
         self.pending_codes: Set[str] = set()  # any live unfilled for that code
 
+        # 최소침습 상태머신/롤백 보강
+        self.order_state: Dict[str, str] = defaultdict(str)   # NONE/BUY_SENT/BUY_WORKING/BUY_FILLED/SELL_SENT/SELL_WORKING/SELL_FILLED/REJECTED/CANCELED
+        self.order_state_ts: Dict[str, float] = {}
+        self.order_meta: Dict[str, Dict[str, Any]] = {}       # code -> last sent order meta
+        self.order_no_to_code: Dict[str, str] = {}
+
+        # 운영/분석용 메트릭
+        self.metrics: Dict[str, int] = defaultdict(int)
+        self.metric_reasons: Dict[str, int] = defaultdict(int)
+        self._last_metrics_emit_ts = 0.0
+
+        # 조건 진동 완화용
+        self.cond_toggle_hist: Dict[Tuple[str, str], deque] = defaultdict(deque)
+
         # ✅ 로컬 방어막: 잔고 누락 시에도 "추정 노출"로 한도 강제
         self.reserved_exposure: Dict[str, int] = defaultdict(int)
 
@@ -305,6 +340,14 @@ class Kiwoom(QAxWidget):
         self.peak_price: Dict[str, int] = {}
         self.stoploss_stage: Dict[str, int] = defaultdict(int)
         self.stoploss_base_qty: Dict[str, int] = defaultdict(int)
+        # take-profit
+        self.tp_stage: Dict[str, int] = defaultdict(int)      # code -> stage index (0=none)
+        self.tp_base_qty: Dict[str, int] = defaultdict(int)   # code -> base qty for partial take-profit
+
+        # holdings snapshot
+        self._holdings_snapshot_sig = None
+        self._last_holdings_snapshot_ts = 0.0
+
 
         self._risk_running = False
 
@@ -477,6 +520,222 @@ class Kiwoom(QAxWidget):
         more = "" if n <= maxn else f" ... (+{n - maxn})"
         return f"{n} codes: {head}{more}"
 
+    def _metric_inc(self, key: str, amount: int = 1, reason: str = ""):
+        try:
+            key = str(key or "").strip()
+            if not key:
+                return
+            self.metrics[key] += int(amount)
+            if reason:
+                self.metric_reasons[f"{key}:{reason}"] += int(amount)
+        except Exception:
+            pass
+
+    def _emit_metrics_snapshot(self, reason: str = "", force: bool = False):
+        now = time.time()
+        if (not force) and (now - float(self._last_metrics_emit_ts or 0.0) < float(METRICS_EMIT_INTERVAL_SEC)):
+            return
+        self._last_metrics_emit_ts = now
+        try:
+            counters = {k: int(v) for k, v in sorted(self.metrics.items()) if int(v) > 0}
+            reasons = {k: int(v) for k, v in sorted(self.metric_reasons.items()) if int(v) > 0}
+            state_counts = defaultdict(int)
+            for _code, st in list(self.order_state.items()):
+                st = str(st or "")
+                if st:
+                    state_counts[st] += 1
+            payload = {
+                "reason": reason,
+                "counters": counters,
+                "reasons": reasons,
+                "order_states": {k: int(v) for k, v in sorted(state_counts.items()) if int(v) > 0},
+                "pending_codes": sorted(list(self.pending_codes)),
+            }
+            self.report.emit("METRICS_SNAPSHOT", payload)
+            self._log("INFO", f"[METRICS] reason={reason} counters={counters} order_states={payload['order_states']}", key="METRICS_SNAPSHOT", throttle=5.0)
+        except Exception as e:
+            self._log("WARN", f"[METRICS] snapshot emit failed: {e}", key="METRICS_SNAPSHOT_FAIL", throttle=5.0)
+
+    def _set_order_state(self, code: str, state: str, order_no: str = "", **extra):
+        code = _norm_code(code)
+        if not code:
+            return
+        state = str(state or "")
+        self.order_state[code] = state
+        self.order_state_ts[code] = time.time()
+        meta = dict(self.order_meta.get(code, {}) or {})
+        if state:
+            meta["state"] = state
+        if order_no:
+            meta["order_no"] = str(order_no)
+            self.order_no_to_code[str(order_no)] = code
+        for k, v in extra.items():
+            meta[k] = v
+        if meta:
+            self.order_meta[code] = meta
+        self.report.emit("ORDER_STATE", {"code": code, "state": state, "order_no": str(order_no or meta.get('order_no', '')), **extra})
+
+    def _clear_order_state(self, code: str, keep_meta: bool = False):
+        code = _norm_code(code)
+        if not code:
+            return
+        self.order_state.pop(code, None)
+        self.order_state_ts.pop(code, None)
+        if not keep_meta:
+            meta = self.order_meta.pop(code, None)
+            try:
+                order_no = str((meta or {}).get("order_no", "")).strip()
+                if order_no:
+                    self.order_no_to_code.pop(order_no, None)
+            except Exception:
+                pass
+
+    def _live_unfilled_exists(self, code: str) -> bool:
+        code = _norm_code(code)
+        if not code:
+            return False
+        for od in (self.unfilled_orders or {}).values():
+            if _norm_code(od.get("code", "")) == code and int(od.get("unfilled", 0) or 0) > 0:
+                return True
+        return False
+
+    def _register_sent_order(self, code: str, side: str, qty: int, price: int, reason: str = "", cond: str = "", reserved_amount: int = 0, pre_bought_added: bool = False):
+        code = _norm_code(code)
+        if not code:
+            return
+        side = str(side or "").upper()
+        self._set_order_state(
+            code,
+            f"{side}_SENT",
+            side=side,
+            qty=int(qty or 0),
+            price=int(price or 0),
+            reason=str(reason or ""),
+            cond=str(cond or ""),
+            sent_ts=time.time(),
+            reserved_amount=int(reserved_amount or 0),
+            pre_bought_added=bool(pre_bought_added),
+            rollback_done=False,
+        )
+
+    def _rollback_sent_order(self, code: str, source: str, detail: str = ""):
+        code = _norm_code(code)
+        if not code:
+            return False
+        meta = dict(self.order_meta.get(code, {}) or {})
+        if not meta:
+            return False
+        if meta.get("rollback_done"):
+            return False
+        if self._live_unfilled_exists(code):
+            return False
+
+        side = str(meta.get("side", "")).upper()
+        order_no = str(meta.get("order_no", "")).strip()
+        reserved_amount = int(meta.get("reserved_amount", 0) or 0)
+        pre_bought_added = bool(meta.get("pre_bought_added", False))
+        hold_qty = int(self.holdings_qty.get(code, 0) or 0)
+
+        if side == "BUY":
+            if hold_qty > 0:
+                return False
+            if reserved_amount > 0:
+                self.reserved_exposure[code] = max(0, int(self.reserved_exposure.get(code, 0) or 0) - reserved_amount)
+            if pre_bought_added and code in self.bought_today:
+                self.bought_today.discard(code)
+                if BOUGHT_TODAY_PERSIST:
+                    self._save_bought_today()
+            self.pending_codes.discard(code)
+        elif side == "SELL":
+            if hold_qty <= 0:
+                return False
+            self.pending_codes.discard(code)
+            self.rebuy_block_pending.discard(code)
+            self.rebuy_block_until.pop(code, None)
+        else:
+            self.pending_codes.discard(code)
+
+        meta["rollback_done"] = True
+        meta["rollback_source"] = str(source or "")
+        meta["rollback_detail"] = str(detail or "")
+        self.order_meta[code] = meta
+        self._set_order_state(code, "CANCELED", order_no=order_no, side=side, source=str(source or ""), detail=str(detail or ""))
+        self._metric_inc("order_rollback", reason=f"{side}:{source}")
+        self._log("WARN", f"[ORDER-ROLLBACK] code={self._code_tag(code)} side={side} source={source} detail={detail}", key=f"ORDER_ROLLBACK_{code}_{side}_{source}", throttle=0.0)
+        self.report.emit("ORDER_ROLLBACK", {"code": code, "side": side, "order_no": order_no, "source": str(source or ""), "detail": str(detail or "")})
+        return True
+
+    def _cleanup_stale_order_intents(self):
+        now = time.time()
+        for code, meta in list(self.order_meta.items()):
+            try:
+                state = str(meta.get("state", "") or "")
+                if state not in {"BUY_SENT", "SELL_SENT", "BUY_WORKING", "SELL_WORKING"}:
+                    continue
+                sent_ts = float(meta.get("sent_ts", self.order_state_ts.get(code, 0.0)) or 0.0)
+                if sent_ts <= 0:
+                    continue
+                if (now - sent_ts) < float(ORDER_INTENT_TIMEOUT_SEC):
+                    continue
+                if self._live_unfilled_exists(code):
+                    continue
+                side = str(meta.get("side", "") or "").upper()
+                hold_qty = int(self.holdings_qty.get(code, 0) or 0)
+                if side == "BUY" and hold_qty > 0:
+                    continue
+                if side == "SELL" and hold_qty <= 0:
+                    continue
+                self._rollback_sent_order(code, source="TIMEOUT", detail=f"state={state}")
+            except Exception as e:
+                self._log("WARN", f"[ORDER-TIMEOUT] cleanup failed code={code}: {e}", key=f"ORDER_TIMEOUT_ERR_{code}", throttle=5.0)
+
+    def _recent_sent_candidates(self, side: str, within_sec: float = 3.0):
+        side = str(side or "").upper()
+        now = time.time()
+        out = []
+        for code, meta in list(self.order_meta.items()):
+            try:
+                if str(meta.get("side", "")).upper() != side:
+                    continue
+                st = str(meta.get("state", ""))
+                if st not in {f"{side}_SENT", f"{side}_WORKING"}:
+                    continue
+                sent_ts = float(meta.get("sent_ts", self.order_state_ts.get(code, 0.0)) or 0.0)
+                if sent_ts > 0 and (now - sent_ts) <= float(within_sec):
+                    out.append(code)
+            except Exception:
+                continue
+        return out
+
+    def _get_cached_price(self, code: str, max_age_sec: float = 2.0) -> Optional[int]:
+        code = _norm_code(code)
+        cached = self._price_cache.get(code)
+        if not cached:
+            return None
+        price, ts = cached
+        if int(price or 0) <= 0:
+            return None
+        if (time.time() - float(ts)) <= float(max_age_sec):
+            return int(price)
+        return None
+
+    def _track_condition_toggle(self, code: str, cond_name: str, event_type: str) -> float:
+        code = _norm_code(code)
+        cond_name = str(cond_name or "")
+        event_type = str(event_type or "")
+        key = (code, cond_name)
+        dq = self.cond_toggle_hist[key]
+        now = time.time()
+        dq.append((now, event_type))
+        while dq and (now - float(dq[0][0])) > float(CONDITION_CHATTER_WINDOW_SEC):
+            dq.popleft()
+        if len(dq) >= int(CONDITION_CHATTER_COUNT):
+            self._metric_inc("cond_chatter_detected", reason=cond_name)
+            self._log("WARN", f"[COND-CHATTER] 감지: {self._code_tag(code)} cond={cond_name} toggles={len(dq)} window={CONDITION_CHATTER_WINDOW_SEC}s", key=f"COND_CHATTER_{code}_{cond_name}", throttle=2.0)
+            self.report.emit("COND_CHATTER", {"code": code, "cond": cond_name, "toggle_count": len(dq), "window_sec": float(CONDITION_CHATTER_WINDOW_SEC)})
+            return float(CONDITION_CHATTER_EXTRA_DELAY_SEC)
+        return 0.0
+
     # -----------------------
     # Trade window gate (KST)
     # -----------------------
@@ -540,6 +799,7 @@ class Kiwoom(QAxWidget):
         except Exception:
             pass
 
+        self._cleanup_stale_order_intents()
         self._stop_all_conditions()
 
     def _trade_window_guard_tick(self):
@@ -614,6 +874,7 @@ class Kiwoom(QAxWidget):
                     key=f"PRICE_FAIL_{code}",
                     throttle=0.5,
                 )
+                self._metric_inc("price_tr_fail", reason=code)
                 self.report.emit("PRICE_FAIL", {"code": code, "attempt": attempt, "via": "TR_NOW"})
             time.sleep(PRICE_RETRY_SLEEP)
 
@@ -655,6 +916,7 @@ class Kiwoom(QAxWidget):
                     key=f"TR_BUSY_{rq_name}",
                     throttle=0.5,
                 )
+                self._metric_inc("tr_skip_busy", reason=rq_name)
                 self.report.emit("TR_SKIP_BUSY", {"rq": rq_name, "busy_rq": self._tr_busy_name})
                 return False
 
@@ -665,6 +927,7 @@ class Kiwoom(QAxWidget):
         ret = self.dynamicCall("CommRqData(QString, QString, int, QString)", rq_name, tr_code, int(prev_next), screen)
         if ret != 0:
             self._log("WARN", f"[TR-SERIAL] CommRqData fail ret={ret} rq={rq_name}", key=f"TR_FAIL_{rq_name}", throttle=0.5)
+            self._metric_inc("tr_fail", reason=rq_name)
             self.report.emit("TR_FAIL", {"rq": rq_name, "tr": tr_code, "ret": ret})
             self._tr_release()
             return False
@@ -691,6 +954,7 @@ class Kiwoom(QAxWidget):
             return
         if time.time() >= self._tr_deadline:
             self._log("ERROR", f"[TR-SERIAL] timeout rq={self._tr_busy_name} -> force release", key=f"TR_TO_{self._tr_busy_name}", throttle=0.5)
+            self._metric_inc("tr_timeout", reason=self._tr_busy_name)
             self.report.emit("TR_TIMEOUT", {"rq": self._tr_busy_name})
             self._tr_release()
             if self.tr_loop.isRunning():
@@ -837,6 +1101,8 @@ class Kiwoom(QAxWidget):
         if not code:
             return
 
+        extra_delay = self._track_condition_toggle(code, cond_name, event_type)
+
         if event_type == "I":
             self._log("INFO", f"[COND-REAL] cond={cond_name} 편입(I): {self._code_tag(code)}", key=f"COND_I_{cond_name}_{code}", throttle=0.5)
             self.report.emit("COND_REAL_I", {"cond": cond_name, "code": code, "idx": int(cond_index)})
@@ -860,7 +1126,7 @@ class Kiwoom(QAxWidget):
                     self.report.emit("SELL_DELAY_SKIP_BOUGHT_TODAY", {"code": code, "cond": cond_name})
                     return
 
-                self._schedule_delayed_sell(code, cond_name, reason="COND_EXIT")
+                self._schedule_delayed_sell(code, cond_name, reason="COND_EXIT", extra_delay_sec=extra_delay)
 
     # -----------------------
     # TR Receive
@@ -882,9 +1148,6 @@ class Kiwoom(QAxWidget):
                 self.tr_loop.exit()
             return
 
-        # ✅ 잔고 연속조회 (여기서 끊김)
-        if rq_name == "opw00018_req":
-            pass # 잘린 부분을 채우거나 이어서 작성하세요
 
         # ✅ 잔고 연속조회
         if rq_name == "opw00018_req":
@@ -949,9 +1212,26 @@ class Kiwoom(QAxWidget):
 
     # ✅ (A) 주문 거부/사유 MSG를 INFO로도 출력
     def _on_receive_msg(self, scr_no, rq_name, tr_code, msg):
+        msg = str(msg)
         self._log("INFO", f"[MSG] scr={scr_no} rq={rq_name} tr={tr_code} msg={msg}",
                   key="MSG_INFO", throttle=0.0)
-        self.report.emit("MSG", {"scr": str(scr_no), "rq": str(rq_name), "tr": str(tr_code), "msg": str(msg)})
+        self.report.emit("MSG", {"scr": str(scr_no), "rq": str(rq_name), "tr": str(tr_code), "msg": msg})
+
+        sell_fail_keywords = ["매도가능수량", "주문가능수량", "잔고가 부족", "수량이 부족"]
+        buy_fail_keywords = ["증거금", "예수금", "주문가능금액", "주문금액"]
+
+        if any(k in msg for k in sell_fail_keywords):
+            self._metric_inc("msg_sell_reject")
+            cands = self._recent_sent_candidates("SELL", within_sec=3.0)
+            if len(cands) == 1:
+                self._metric_inc("msg_sell_reject_heuristic")
+                self._rollback_sent_order(cands[0], source="MSG", detail=msg)
+        elif any(k in msg for k in buy_fail_keywords):
+            self._metric_inc("msg_buy_reject")
+            cands = self._recent_sent_candidates("BUY", within_sec=3.0)
+            if len(cands) == 1:
+                self._metric_inc("msg_buy_reject_heuristic")
+                self._rollback_sent_order(cands[0], source="MSG", detail=msg)
 
     # -----------------------
     # TR Request
@@ -961,18 +1241,30 @@ class Kiwoom(QAxWidget):
         if not code:
             return None
 
-        cached = self._price_cache.get(code)
+        cached = self._get_cached_price(code, max_age_sec=2.0)
         if cached:
-            price, ts = cached
-            if (time.time() - float(ts)) <= 2.0 and int(price) > 0:
-                return int(price)
+            return int(cached)
 
         if self._tr_busy:
             self._enqueue_price_request(code, why="TR_BUSY")
             self.report.emit("PRICE_QUEUED", {"code": code, "why": "TR_BUSY"})
+            stale = self._get_cached_price(code, max_age_sec=PRICE_CACHE_HARD_TTL_SEC)
+            if stale:
+                self._metric_inc("price_use_stale_cache")
+                self.report.emit("PRICE_STALE_CACHE_USED", {"code": code, "price": int(stale), "why": "TR_BUSY", "max_age_sec": float(PRICE_CACHE_HARD_TTL_SEC)})
+                return int(stale)
             return None
 
-        return self._request_price_tr_now(code)
+        price = self._request_price_tr_now(code)
+        if price:
+            return int(price)
+
+        stale = self._get_cached_price(code, max_age_sec=PRICE_CACHE_HARD_TTL_SEC)
+        if stale:
+            self._metric_inc("price_use_stale_cache")
+            self.report.emit("PRICE_STALE_CACHE_USED", {"code": code, "price": int(stale), "why": "TR_FAIL", "max_age_sec": float(PRICE_CACHE_HARD_TTL_SEC)})
+            return int(stale)
+        return None
 
     def request_balance(self):
         now = time.time()
@@ -1033,6 +1325,11 @@ class Kiwoom(QAxWidget):
                 if name:
                     self.code_name_cache[code] = name
 
+                cur_raw, _cur_field = self._get_comm_data_multi(tr_code, rq_name, i, ["현재가", "현재가(평가)", "평가금액"])
+                cur = abs(_safe_int(cur_raw, 0))
+                if cur > 0:
+                    self._price_cache[code] = (cur, time.time())
+
             if qty > 0 and avg <= 0:
                 self._log(
                     "WARN",
@@ -1054,6 +1351,26 @@ class Kiwoom(QAxWidget):
         self.holdings_qty = new_qty
         self.holdings_avg = new_avg
         self.holdings_name = new_name
+
+        # take-profit base qty init (기준수량): 봇 시작/잔고 동기화 시 최초 보유수량을 고정
+        for c, q in list(self.holdings_qty.items()):
+            q = int(q or 0)
+            if q > 0 and int(self.tp_base_qty.get(c, 0) or 0) <= 0:
+                self.tp_base_qty[c] = q
+
+        # take-profit state cleanup (보유수량 0이면 정리)
+        for c in list(self.tp_stage.keys()):
+            if self.holdings_qty.get(c, 0) <= 0:
+                self.tp_stage.pop(c, None)
+        for c in list(self.tp_base_qty.keys()):
+            if self.holdings_qty.get(c, 0) <= 0:
+                self.tp_base_qty.pop(c, None)
+
+        for code in list(self.order_meta.keys()):
+            if self.holdings_qty.get(code, 0) <= 0 and (not self._live_unfilled_exists(code)):
+                if self.order_state.get(code) not in {"SELL_FILLED", "CANCELED", "REJECTED"}:
+                    self._clear_order_state(code)
+                self.reserved_exposure.pop(code, None)
 
         for code in list(self.peak_price.keys()):
             if self.holdings_qty.get(code, 0) <= 0:
@@ -1084,6 +1401,8 @@ class Kiwoom(QAxWidget):
         for c, q in list(self.holdings_qty.items())[:50]:
             sample.append({"code": c, "qty": int(q), "avg": int(self.holdings_avg.get(c, 0) or 0)})
         self.report.emit("BAL_SNAPSHOT", {"count": len(self.holdings_qty), "sample": sample})
+        self._save_holdings_snapshot(reason="BAL_CHANGED")
+
 
     def _parse_unfilled_page(self, tr_code, rq_name, is_first: bool):
         cnt = _safe_int(self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name), 0)
@@ -1109,9 +1428,17 @@ class Kiwoom(QAxWidget):
 
         self.unfilled_orders = new_unfilled
         live_pending_codes = set()
+        side_map = {}
         for od in self.unfilled_orders.values():
-            live_pending_codes.add(od["code"])
+            c = _norm_code(od["code"])
+            live_pending_codes.add(c)
+            bs = str(od.get("bs", "") or "")
+            side_map[c] = "BUY" if (("매수" in bs) or bs.startswith("+")) else ("SELL" if (("매도" in bs) or bs.startswith("-")) else "")
         self.pending_codes = live_pending_codes
+        for c in list(live_pending_codes):
+            side = side_map.get(c, str((self.order_meta.get(c, {}) or {}).get("side", "")))
+            if side:
+                self._set_order_state(c, f"{side}_WORKING", side=side)
 
         if not changed:
             return
@@ -1166,6 +1493,16 @@ class Kiwoom(QAxWidget):
                 })
 
             if order_no and code:
+                side = "BUY" if (("매수" in bs) or str(bs).startswith("+")) else ("SELL" if (("매도" in bs) or str(bs).startswith("-")) else "")
+                self._set_order_state(code, f"{side}_WORKING" if side and unfilled > 0 else (f"{side}_FILLED" if side and unfilled <= 0 else str(self.order_state.get(code, ""))), order_no=order_no, side=side, status=status, reject=reject, unfilled=int(unfilled), qty=int(qty))
+
+                reject_hit = False
+                reject_keywords = ["거부", "실패", "취소거부", "정정거부"]
+                if reject and str(reject).strip():
+                    reject_hit = True
+                if any(k in str(status) for k in reject_keywords):
+                    reject_hit = True
+
                 if unfilled > 0:
                     self.unfilled_orders[order_no] = {"code": code, "bs": bs, "qty": qty, "unfilled": unfilled, "price": 0}
                     self.pending_codes.add(code)
@@ -1174,6 +1511,11 @@ class Kiwoom(QAxWidget):
                     still = any(v["code"] == code and v.get("unfilled", 0) > 0 for v in self.unfilled_orders.values())
                     if not still:
                         self.pending_codes.discard(code)
+
+                if reject_hit:
+                    self._metric_inc("chejan_reject", reason=side or "UNKNOWN")
+                    self._set_order_state(code, "REJECTED", order_no=order_no, side=side, status=status, reject=reject)
+                    self._rollback_sent_order(code, source="CHEJAN_REJECT", detail=f"status={status} reject={reject}")
 
                 try:
                     self._last_unfilled_sig = tuple(
@@ -1215,6 +1557,19 @@ class Kiwoom(QAxWidget):
                         if BOUGHT_TODAY_PERSIST:
                             self._save_bought_today()
 
+                    # take-profit base qty init (체잔 신규편입 시점 수량을 기준으로 고정)
+                    if int(self.tp_base_qty.get(code, 0) or 0) <= 0:
+                        self.tp_base_qty[code] = int(qty)
+                        # tp_stage는 기본 0 유지
+
+                    if before_qty <= 0:
+                        self._set_order_state(code, "BUY_FILLED", side="BUY", holding_qty=int(qty), avg=int(avg or 0))
+                    else:
+                        cur_state = str(self.order_state.get(code, ""))
+                        if cur_state.startswith("SELL_"):
+                            self._set_order_state(code, cur_state, side="SELL", holding_qty=int(qty), avg=int(avg or 0))
+
+                    self._save_holdings_snapshot(reason="CHEJAN_HOLDING")
                     self.report.emit("CHEJAN_HOLDING", {"code": code, "name": name, "qty": qty, "avg": avg})
 
                 else:
@@ -1233,6 +1588,10 @@ class Kiwoom(QAxWidget):
                         if SOLD_TODAY_PERSIST:
                             self._save_sold_today()
 
+                    self.tp_stage.pop(code, None)
+                    self.tp_base_qty.pop(code, None)
+                    self._set_order_state(code, "SELL_FILLED", side="SELL", holding_qty=0)
+                    self._save_holdings_snapshot(reason="CHEJAN_HOLDING_ZERO")
                     self.report.emit("CHEJAN_HOLDING_ZERO", {"code": code, "name": name})
 
     # -----------------------
@@ -1377,6 +1736,7 @@ class Kiwoom(QAxWidget):
         if not price:
             self._set_buy_block_reason(code, "NO_PRICE")
             self._log("WARN", f"[BUY] 현재가 실패 -> 스킵: {self._code_tag(code)} cond={cond}", key=f"BUY_NOPRICE_{code}", throttle=1.0)
+            self._metric_inc("buy_skip_no_price", reason=cond)
             self.report.emit("BUY_SKIP_NO_PRICE", {"code": code, "cond": cond})
             return
 
@@ -1384,6 +1744,7 @@ class Kiwoom(QAxWidget):
         if not ok:
             self._set_buy_block_reason(code, reason)
             self._log("INFO", f"[BUY] 스킵: {self._code_tag(code)} cond={cond} reason={reason}", key=f"BUY_BLOCK_{code}", throttle=0.5)
+            self._metric_inc("buy_block", reason=reason)
             self.report.emit("BUY_BLOCK", {"code": code, "cond": cond, "reason": reason, "price": price})
             return
 
@@ -1416,16 +1777,19 @@ class Kiwoom(QAxWidget):
             self._log("INFO", f"[BUY-LIMIT] reserved_exposure += {order_amount} -> now={self.reserved_exposure[code]} for {self._code_tag(code)}",
                       key=f"RESERVE_ADD_{code}", throttle=0.0)
 
-            self.report.emit("BUY_SENT", {"code": code, "cond": cond, "qty": qty, "price": price, "order_amount": order_amount,
-                                          "reserved_exposure": int(self.reserved_exposure.get(code, 0) or 0)})
-
+            pre_bought_added = False
             if code not in self.bought_today:
                 self.bought_today.add(code)
+                pre_bought_added = True
                 self._log("INFO", f"[BOUGHT-TODAY] ✅ 주문요청 선등록(체잔 전): {self._code_tag(code)}",
                           key=f"BOUGHT_PRE_{code}", throttle=0.0)
                 if BOUGHT_TODAY_PERSIST:
                     self._save_bought_today()
                 self.report.emit("BOUGHT_TODAY_ADD", {"code": code, "via": "BUY_SENT_PRE_CHEJAN"})
+
+            self._register_sent_order(code, "BUY", qty, price, reason="BUY", cond=cond, reserved_amount=order_amount, pre_bought_added=pre_bought_added)
+            self.report.emit("BUY_SENT", {"code": code, "cond": cond, "qty": qty, "price": price, "order_amount": order_amount,
+                                          "reserved_exposure": int(self.reserved_exposure.get(code, 0) or 0), "pre_bought_added": bool(pre_bought_added)})
         else:
             self._log("WARN", f"[BUY] ❌ 주문실패: {self._code_tag(code)} cond={cond} ret={ret}", key=f"BUY_FAIL_{code}", throttle=1.0)
             self._set_buy_block_reason(code, f"ORDER_FAIL_{ret}")
@@ -1434,17 +1798,21 @@ class Kiwoom(QAxWidget):
     # -----------------------
     # Delayed sell / risk / orphan
     # -----------------------
-    def _schedule_delayed_sell(self, code: str, cond: str, reason: str):
+    def _schedule_delayed_sell(self, code: str, cond: str, reason: str, extra_delay_sec: float = 0.0):
         if not self._in_trade_window():
             return
         code = _norm_code(code)
         if not code:
             return
-        due = time.time() + float(SELL_DELAY_SEC)
+        extra_delay_sec = max(0.0, float(extra_delay_sec or 0.0))
+        due_in_sec = float(SELL_DELAY_SEC) + extra_delay_sec
+        due = time.time() + due_in_sec
         self.delayed_sells[(code, cond)] = due
-        self._log("INFO", f"[SELL-DELAY] 예약: {self._code_tag(code)} cond={cond} after={SELL_DELAY_SEC}s (reason={reason})",
+        if extra_delay_sec > 0:
+            self._metric_inc("sell_delay_extra_due_chatter", reason=cond)
+        self._log("INFO", f"[SELL-DELAY] 예약: {self._code_tag(code)} cond={cond} after={due_in_sec}s (base={SELL_DELAY_SEC}s extra={extra_delay_sec}s reason={reason})",
                   key=f"SELL_SCHED_{code}_{cond}", throttle=0.2)
-        self.report.emit("SELL_DELAY_SCHEDULE", {"code": code, "cond": cond, "due_in_sec": float(SELL_DELAY_SEC), "reason": reason})
+        self.report.emit("SELL_DELAY_SCHEDULE", {"code": code, "cond": cond, "due_in_sec": due_in_sec, "base_delay_sec": float(SELL_DELAY_SEC), "extra_delay_sec": extra_delay_sec, "reason": reason})
 
     def _has_pending_sell(self, code: str) -> bool:
         code = _norm_code(code)
@@ -1467,6 +1835,11 @@ class Kiwoom(QAxWidget):
             return
         if qty > hold_qty:
             qty = hold_qty
+        if code in self.pending_codes or self._has_pending_sell(code):
+            self._metric_inc("sell_skip_pending", reason=reason)
+            self._log("INFO", f"[SELL] 스킵: 이미 주문/미체결 존재 -> {self._code_tag(code)} qty={qty} reason={reason}", key=f"SELL_SKIP_PENDING_{code}_{reason}", throttle=0.2)
+            self.report.emit("SELL_SKIP_PENDING", {"code": code, "qty": qty, "reason": reason, "mode": "PARTIAL"})
+            return
 
         self._log("INFO", f"[SELL] 주문전송: {self._code_tag(code)} qty={qty} 시장가 reason={reason}",
                   key=f"SELL_SEND_{code}_{reason}", throttle=0.0)
@@ -1479,6 +1852,7 @@ class Kiwoom(QAxWidget):
                       key=f"SELL_OK_{code}_{reason}", throttle=0.0)
             self.pending_codes.add(code)
             self._set_rebuy_block(code, cooldown_sec=REBUY_COOLDOWN_SEC)
+            self._register_sent_order(code, "SELL", qty, 0, reason=reason)
             self.report.emit("SELL_OK", {"code": code, "qty": qty, "reason": reason, "mode": "PARTIAL"})
         else:
             self._log("WARN", f"[SELL] ❌ 주문실패: {self._code_tag(code)} ret={ret} reason={reason}",
@@ -1489,6 +1863,11 @@ class Kiwoom(QAxWidget):
         code = _norm_code(code)
         qty = int(self.holdings_qty.get(code, 0) or 0)
         if qty <= 0:
+            return
+        if code in self.pending_codes or self._has_pending_sell(code):
+            self._metric_inc("sell_skip_pending", reason=reason)
+            self._log("INFO", f"[SELL] 스킵(전량): 이미 주문/미체결 존재 -> {self._code_tag(code)} reason={reason}", key=f"SELL_SKIP_PENDING_ALL_{code}_{reason}", throttle=0.2)
+            self.report.emit("SELL_SKIP_PENDING", {"code": code, "qty": qty, "reason": reason, "mode": "ALL"})
             return
 
         self._log("INFO", f"[SELL] 주문전송(전량): {self._code_tag(code)} qty={qty} 시장가 reason={reason}",
@@ -1502,6 +1881,7 @@ class Kiwoom(QAxWidget):
                       key=f"SELL_OK_{code}", throttle=0.2)
             self.pending_codes.add(code)
             self._set_rebuy_block(code, cooldown_sec=REBUY_COOLDOWN_SEC)
+            self._register_sent_order(code, "SELL", qty, 0, reason=reason)
             self.report.emit("SELL_OK", {"code": code, "qty": qty, "reason": reason, "mode": "ALL"})
         else:
             self._log("WARN", f"[SELL] ❌ 주문실패: {self._code_tag(code)} ret={ret}",
@@ -1579,6 +1959,7 @@ class Kiwoom(QAxWidget):
             if hold_qty <= 0:
                 continue
             if code in self.pending_codes:
+                self._metric_inc("sell_delay_skip_pending", reason=cond)
                 continue
 
             self._request_sell_all(code, reason=f"EXIT_{cond}_DELAY{SELL_DELAY_SEC}s")
@@ -1669,13 +2050,25 @@ class Kiwoom(QAxWidget):
                     self.report.emit("RISK_SKIP_NOAVG", {"code": code, "avg": avg})
                     continue
 
+                if code in self.pending_codes:
+                    self._metric_inc("risk_skip_pending", reason=code)
+                    self.report.emit("RISK_SKIP_PENDING", {"code": code, "order_state": str(self.order_state.get(code, ""))})
+                    continue
+
                 if self._has_pending_sell(code):
+                    self._metric_inc("risk_skip_pending_sell", reason=code)
                     continue
 
                 cur = self.request_price(code)
+                if (not cur or cur <= 0):
+                    cur = self._get_cached_price(code, max_age_sec=PRICE_CACHE_HARD_TTL_SEC)
+                    if cur and cur > 0:
+                        self._metric_inc("risk_use_stale_price", reason=code)
+                        self.report.emit("RISK_USE_STALE_PRICE", {"code": code, "price": int(cur), "max_age_sec": float(PRICE_CACHE_HARD_TTL_SEC)})
                 if not cur or cur <= 0:
                     self._log("DEBUG", f"[RISK] 현재가 미확보(큐잉/실패) -> 스킵: {self._code_tag(code)}",
                               key=f"RISK_NOPRICE_{code}", throttle=1.0)
+                    self._metric_inc("risk_skip_noprice", reason=code)
                     self.report.emit("RISK_SKIP_NOPRICE", {"code": code})
                     continue
 
@@ -1746,6 +2139,65 @@ class Kiwoom(QAxWidget):
                         })
                         self._request_sell_all(code, reason=f"TRAILING_{TRAILING_STOP_PCT:.0f}")
                         continue
+                # 3) TAKEPROFIT (부분익절): +10% 30%, +15% 30% (기준수량의 30%)
+                if TAKEPROFIT_ENABLED:
+                    try:
+                        levels = list(TAKEPROFIT_LEVELS) if isinstance(TAKEPROFIT_LEVELS, (list, tuple)) else []
+                        levels = sorted(levels, key=lambda x: float(x[0]))  # 10 -> 15
+                    except Exception:
+                        levels = [(10.0, 0.30), (15.0, 0.30)]
+
+                    tp_stage = int(self.tp_stage.get(code, 0) or 0)
+                    if tp_stage < len(levels):
+                        thr_pct, ratio = levels[tp_stage]
+
+                        if pnl_pct >= float(thr_pct):
+                            # pending_codes에 이미 있으면(주문/미체결) stage 업데이트 판별이 애매하므로 스킵
+                            if code in self.pending_codes:
+                                self.report.emit("TAKEPROFIT_SKIP_PENDING", {"code": code, "stage": tp_stage, "thr_pct": float(thr_pct)})
+                            else:
+                                base_qty = int(self.tp_base_qty.get(code, 0) or 0)
+                                if base_qty <= 0:
+                                    base_qty = int(qty)
+
+                                sell_qty = int(base_qty * float(ratio))
+                                sell_qty = max(int(TAKEPROFIT_MIN_QTY), sell_qty)
+                                sell_qty = max(1, min(int(qty), int(sell_qty)))
+
+                                self._log(
+                                    "INFO",
+                                    f"[TAKEPROFIT] 발동: {self._code_tag(code)} pnl={pnl_pct:.2f}% "
+                                    f"stage={tp_stage+1}/{len(levels)} thr=+{thr_pct}% ratio={ratio} base_qty={base_qty} sell_qty={sell_qty}",
+                                    key=f"TP_FIRE_{code}_{tp_stage}",
+                                    throttle=0.0,
+                                )
+                                self.report.emit("TAKEPROFIT_FIRE", {
+                                    "code": code, "cur": cur, "avg": avg, "pnl_pct": pnl_pct,
+                                    "stage": tp_stage, "thr_pct": float(thr_pct), "ratio": float(ratio),
+                                    "base_qty": int(base_qty), "sell_qty": int(sell_qty), "cur_qty": int(qty),
+                                })
+
+                                self._save_holdings_snapshot(reason="BEFORE_TAKEPROFIT")
+
+                                before_pending = (code in self.pending_codes)
+                                self._request_sell_qty(code, sell_qty, reason=f"TP{tp_stage+1}@+{thr_pct}%")
+                                after_pending = (code in self.pending_codes)
+
+                                # 주문요청(ret=0) 성공이면 pending_codes에 들어가므로 그때만 stage 업데이트
+                                if (not before_pending) and after_pending:
+                                    self.tp_stage[code] = tp_stage + 1
+                                    self.report.emit("TAKEPROFIT_STAGE_SET", {"code": code, "stage": int(self.tp_stage.get(code, 0) or 0)})
+                                else:
+                                    self._log(
+                                        "WARN",
+                                        f"[TAKEPROFIT] 주문요청 실패/미확인 -> stage 유지: {self._code_tag(code)} stage={tp_stage} thr=+{thr_pct}%",
+                                        key=f"TP_NOADV_{code}_{tp_stage}",
+                                        throttle=2.0,
+                                    )
+                                    self.report.emit("TAKEPROFIT_NO_STAGE_ADVANCE", {"code": code, "stage": tp_stage, "thr_pct": float(thr_pct)})
+
+                                continue
+
 
         except Exception as e:
             self._log("ERROR", f"[RISK] monitor error: {e}", key="RISK_ERR", throttle=5.0)
@@ -1767,6 +2219,8 @@ class Kiwoom(QAxWidget):
             return
         if self._risk_running:
             return
+        self._cleanup_stale_order_intents()
+        self._emit_metrics_snapshot(reason="PERIODIC_SYNC")
         if self._tr_busy:
             return
         self.request_balance()
@@ -1775,6 +2229,54 @@ class Kiwoom(QAxWidget):
     # -----------------------
     # Persistence
     # -----------------------
+    def _make_holdings_snapshot(self) -> Dict[str, Any]:
+        # 현재 보유종목(계좌) 스냅샷을 JSON으로 저장하기 위한 dict 생성
+        items = []
+        for code in sorted(self.holdings_qty.keys()):
+            qty = int(self.holdings_qty.get(code, 0) or 0)
+            if qty <= 0:
+                continue
+            items.append({
+                "code": code,
+                "name": self._get_code_name(code),
+                "qty": qty,
+                "avg": int(self.holdings_avg.get(code, 0) or 0),
+                "tp_stage": int(self.tp_stage.get(code, 0) or 0),
+                "tp_base_qty": int(self.tp_base_qty.get(code, 0) or 0),
+            })
+        return {
+            "day": _today_yyyymmdd(),
+            "ts": _now_iso(),
+            "account": self.account,
+            "holdings": items,
+        }
+
+    def _save_holdings_snapshot(self, reason: str = "", force: bool = False):
+        if not HOLDINGS_SNAPSHOT_ENABLED:
+            return
+        try:
+            snap = self._make_holdings_snapshot()
+            sig = tuple((x["code"], int(x["qty"]), int(x["avg"]), int(x.get("tp_stage", 0)), int(x.get("tp_base_qty", 0)))
+                        for x in snap.get("holdings", []))
+            if (not force) and (sig == self._holdings_snapshot_sig):
+                return
+            self._holdings_snapshot_sig = sig
+
+            with open(HOLDINGS_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2)
+
+            self.report.emit("HOLDINGS_SNAPSHOT_SAVED", {
+                "file": HOLDINGS_SNAPSHOT_FILE,
+                "count": len(snap.get("holdings", [])),
+                "reason": reason,
+            })
+        except Exception as e:
+            self._log("WARN", f"[HOLDINGS] snapshot save failed: {e}", key="HOLD_SNAP_FAIL", throttle=2.0)
+            try:
+                self.report.emit("HOLDINGS_SNAPSHOT_SAVE_FAIL", {"err": repr(e), "reason": reason})
+            except Exception:
+                pass
+
     def _load_sold_today(self):
         try:
             if not os.path.exists(SOLD_TODAY_FILE):
@@ -1864,15 +2366,20 @@ class Kiwoom(QAxWidget):
 
             self._log("INFO", "[RUN] 타이머 시작 완료")
             self.report.emit("RUN_START", {})
+            self._emit_metrics_snapshot(reason="RUN_START", force=True)
         else:
             self._log("INFO", f"[TRADE-WINDOW] 현재 창 밖({TRADE_START_HHMM}-{TRADE_END_HHMM}) -> 자동매매 대기(ON 되면 시작)")
             self.report.emit("RUN_WAIT_WINDOW", {"start": TRADE_START_HHMM, "end": TRADE_END_HHMM})
+            self._emit_metrics_snapshot(reason="RUN_WAIT_WINDOW", force=True)
             # 혹시 모를 잔여 구독/타이머 정리
             self._stop_trade_session()
 
 
 
 def main():
+    month_dir = os.path.join(LOG_DIR, MONTH)
+    os.makedirs(month_dir, exist_ok=True)
+
     app = QApplication(sys.argv)
     kiwoom = Kiwoom()
     try:
@@ -1887,4 +2394,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

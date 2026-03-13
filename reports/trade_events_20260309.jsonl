@@ -1,0 +1,5 @@
+{"ts": "2026-03-09T20:53:32", "day": "20260309", "event": "BOOT_CONFIG", "payload": {"file": "C:\\kiwoomautotrade\\kiwoomautotrade.py", "BUY_COND_NAMES": ["w3"], "SELL_COND_NAMES": ["w", "w3"], "TARGET_BUY_AMOUNT": 150000, "MAX_POSITION_PER_CODE": 150000, "ALLOW_ADD_BUY": false, "SELL_DELAY_SEC": 5.0, "STOPLOSS_TIERS": [[-2.5, 0.5], [-3.0, 0.5], [-4.0, 1.0]], "AUTO_SELL_INTERVAL_SEC": 60, "TRAILING_ENABLED": true, "TRAILING_STOP_PCT": 10.0}}
+{"ts": "2026-03-09T20:53:52", "day": "20260309", "event": "LOGIN_OK", "payload": {"account": "5065410811", "server_gubun": ""}}
+{"ts": "2026-03-09T20:53:59", "day": "20260309", "event": "COND_LIST", "payload": {"conds_total": 32, "buy": ["w3"], "sell": ["w", "w3"], "buy_idx": [4], "sell_idx": [4, 14]}}
+{"ts": "2026-03-09T20:53:59", "day": "20260309", "event": "RUN_WAIT_WINDOW", "payload": {"start": "0850", "end": "2000"}}
+{"ts": "2026-03-09T20:53:59", "day": "20260309", "event": "METRICS_SNAPSHOT", "payload": {"reason": "RUN_WAIT_WINDOW", "counters": {}, "reasons": {}, "order_states": {}, "pending_codes": []}}
