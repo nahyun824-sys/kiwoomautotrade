@@ -36,17 +36,17 @@ from PyQt5.QtCore import QEventLoop, QTimer
 # =========================
 # 사용자 설정
 # =========================
-BUY_COND_NAMES = {"w3", "A"}
-SELL_COND_NAMES = {"w", "w3", "A"}
+BUY_COND_NAMES = {"A", "x2"}
+SELL_COND_NAMES = {"A", "x2"}
 
-TARGET_BUY_AMOUNT = 70000
-MAX_POSITION_PER_CODE = 70000
+TARGET_BUY_AMOUNT = 100000
+MAX_POSITION_PER_CODE = 100000
 ALLOW_ADD_BUY = False
 
 SELL_DELAY_SEC = 5.0
 REBUY_COOLDOWN_SEC = 600.0
 
-STOPLOSS_TIERS = [(-2.5, 0.50), (-3.0, 0.50), (-4.0, 1.00)]
+STOPLOSS_TIERS = [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)]
 AUTO_SELL_INTERVAL_SEC = 60
 
 TRAILING_STOP_PCT = 8.0
@@ -66,6 +66,7 @@ METRICS_EMIT_INTERVAL_SEC = 60.0
 
 ORPHAN_CHECK_INTERVAL_SEC = 10
 ORPHAN_GRACE_SEC = 60
+ORPHAN_ENABLE_AFTER_HHMM = "0905"  # 장초반 오퍼런 스위퍼 지연(예: 09:05 이후부터만 검사 시작)
 
 TODAY = datetime.datetime.now().strftime("%y%m%d")   # 예: 260312
 MONTH = datetime.datetime.now().strftime("%y%m")     # 예: 2603
@@ -104,7 +105,7 @@ HOLDINGS_SNAPSHOT_FILE = "holdings_snapshot.json"
 # +10% 도달 시 보유수량의 30% (기준수량=시작/신규편입 시점 수량) 익절
 # +15% 도달 시 보유수량의 30% (기준수량의 30%) 추가 익절
 TAKEPROFIT_ENABLED = True
-TAKEPROFIT_LEVELS = [(8.0, 0.30), (15.0, 0.30)]  # (pnl_pct_threshold, sell_ratio_of_base_qty)
+TAKEPROFIT_LEVELS = [(8.0, 0.30), (13.0, 0.30)]  # (pnl_pct_threshold, sell_ratio_of_base_qty)
 TAKEPROFIT_MIN_QTY = 1
 
 
@@ -718,6 +719,24 @@ class Kiwoom(QAxWidget):
         if (time.time() - float(ts)) <= float(max_age_sec):
             return int(price)
         return None
+
+    def _is_zero_like_text(self, s: str) -> bool:
+        s = _strip_html(s).strip()
+        if not s:
+            return True
+        compact = re.sub(r"\s+", "", s)
+        return bool(re.fullmatch(r"0+", compact))
+
+    def _is_chejan_reject(self, status: str, reject: str) -> bool:
+        status = _strip_html(status).strip()
+        reject = _strip_html(reject).strip()
+        reject_keywords = ["거부", "실패", "취소거부", "정정거부"]
+
+        if reject and (not self._is_zero_like_text(reject)):
+            return True
+        if any(k in status for k in reject_keywords):
+            return True
+        return False
 
     def _track_condition_toggle(self, code: str, cond_name: str, event_type: str) -> float:
         code = _norm_code(code)
@@ -1496,12 +1515,7 @@ class Kiwoom(QAxWidget):
                 side = "BUY" if (("매수" in bs) or str(bs).startswith("+")) else ("SELL" if (("매도" in bs) or str(bs).startswith("-")) else "")
                 self._set_order_state(code, f"{side}_WORKING" if side and unfilled > 0 else (f"{side}_FILLED" if side and unfilled <= 0 else str(self.order_state.get(code, ""))), order_no=order_no, side=side, status=status, reject=reject, unfilled=int(unfilled), qty=int(qty))
 
-                reject_hit = False
-                reject_keywords = ["거부", "실패", "취소거부", "정정거부"]
-                if reject and str(reject).strip():
-                    reject_hit = True
-                if any(k in str(status) for k in reject_keywords):
-                    reject_hit = True
+                reject_hit = self._is_chejan_reject(status, reject)
 
                 if unfilled > 0:
                     self.unfilled_orders[order_no] = {"code": code, "bs": bs, "qty": qty, "unfilled": unfilled, "price": 0}
@@ -1970,6 +1984,14 @@ class Kiwoom(QAxWidget):
         if self._risk_running:
             return
         try:
+            now_dt = datetime.datetime.now()
+            if str(now_dt.strftime("%H%M")) < str(ORPHAN_ENABLE_AFTER_HHMM):
+                if self.orphan_first_seen:
+                    self.orphan_first_seen.clear()
+                self._log("INFO", f"[ORPHAN] 장초반 유예중: {ORPHAN_ENABLE_AFTER_HHMM} 이전에는 스위퍼 비활성화", key="ORPHAN_STARTUP_GRACE", throttle=30.0)
+                self.report.emit("ORPHAN_STARTUP_GRACE", {"enable_after_hhmm": str(ORPHAN_ENABLE_AFTER_HHMM)})
+                return
+
             now = time.time()
             if not self.holdings_qty:
                 return
