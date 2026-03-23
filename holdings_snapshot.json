@@ -1,103 +1,39 @@
 {
-  "day": "20260320",
-  "ts": "2026-03-20T15:30:28",
+  "day": "20260323",
+  "ts": "2026-03-23T15:19:09",
   "account": "5065410811",
   "holdings": [
     {
-      "code": "001460",
-      "name": "BYC",
-      "qty": 1,
-      "avg": 51200,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "002990",
-      "name": "금호건설",
-      "qty": 18,
-      "avg": 5309,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "003010",
-      "name": "혜인",
-      "qty": 18,
-      "avg": 5530,
-      "tp_stage": 0,
-      "tp_base_qty": 18
-    },
-    {
-      "code": "003100",
-      "name": "선광",
-      "qty": 4,
-      "avg": 22600,
-      "tp_stage": 0,
-      "tp_base_qty": 4
-    },
-    {
-      "code": "003480",
-      "name": "한진중공업홀딩스",
-      "qty": 19,
-      "avg": 5080,
-      "tp_stage": 0,
-      "tp_base_qty": 19
-    },
-    {
-      "code": "004150",
-      "name": "한솔홀딩스",
-      "qty": 7,
-      "avg": 3580,
-      "tp_stage": 0,
-      "tp_base_qty": 27
-    },
-    {
-      "code": "004960",
-      "name": "한신공영",
-      "qty": 2,
-      "avg": 16530,
-      "tp_stage": 0,
-      "tp_base_qty": 6
-    },
-    {
-      "code": "009140",
-      "name": "경인전자",
-      "qty": 2,
-      "avg": 23400,
-      "tp_stage": 0,
-      "tp_base_qty": 4
+      "code": "003280",
+      "name": "흥아해운",
+      "qty": 12,
+      "avg": 3265,
+      "tp_stage": 2,
+      "tp_base_qty": 30
     },
     {
       "code": "010240",
       "name": "흥국",
-      "qty": 18,
+      "qty": 5,
       "avg": 5440,
       "tp_stage": 0,
       "tp_base_qty": 18
     },
     {
-      "code": "012630",
-      "name": "HDC",
-      "qty": 2,
-      "avg": 28400,
+      "code": "019990",
+      "name": "에너토크",
+      "qty": 10,
+      "avg": 9720,
       "tp_stage": 0,
-      "tp_base_qty": 3
+      "tp_base_qty": 10
     },
     {
-      "code": "014790",
-      "name": "HL D&I",
-      "qty": 28,
-      "avg": 3530,
+      "code": "024880",
+      "name": "케이피에프",
+      "qty": 8,
+      "avg": 6650,
       "tp_stage": 0,
-      "tp_base_qty": 28
-    },
-    {
-      "code": "026150",
-      "name": "특수건설",
-      "qty": 14,
-      "avg": 7030,
-      "tp_stage": 0,
-      "tp_base_qty": 14
+      "tp_base_qty": 15
     },
     {
       "code": "032080",
@@ -105,55 +41,31 @@
       "qty": 75,
       "avg": 1328,
       "tp_stage": 0,
-      "tp_base_qty": 10
-    },
-    {
-      "code": "036190",
-      "name": "금화피에스시",
-      "qty": 1,
-      "avg": 36050,
-      "tp_stage": 1,
-      "tp_base_qty": 2
-    },
-    {
-      "code": "036580",
-      "name": "팜스코",
-      "qty": 28,
-      "avg": 3585,
-      "tp_stage": 0,
-      "tp_base_qty": 28
+      "tp_base_qty": 75
     },
     {
       "code": "039740",
       "name": "한국정보공학",
-      "qty": 22,
+      "qty": 16,
       "avg": 3225,
       "tp_stage": 1,
+      "tp_base_qty": 22
+    },
+    {
+      "code": "041520",
+      "name": "이엘씨",
+      "qty": 3,
+      "avg": 8440,
+      "tp_stage": 0,
+      "tp_base_qty": 11
+    },
+    {
+      "code": "046970",
+      "name": "우리로",
+      "qty": 22,
+      "avg": 3210,
+      "tp_stage": 1,
       "tp_base_qty": 31
-    },
-    {
-      "code": "046940",
-      "name": "우원개발",
-      "qty": 20,
-      "avg": 4910,
-      "tp_stage": 0,
-      "tp_base_qty": 20
-    },
-    {
-      "code": "051600",
-      "name": "한전KPS",
-      "qty": 1,
-      "avg": 65900,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "052460",
-      "name": "아이크래프트",
-      "qty": 28,
-      "avg": 3495,
-      "tp_stage": 0,
-      "tp_base_qty": 28
     },
     {
       "code": "053620",
@@ -164,36 +76,12 @@
       "tp_base_qty": 13
     },
     {
-      "code": "054800",
-      "name": "아이디스홀딩스",
-      "qty": 6,
-      "avg": 16240,
-      "tp_stage": 0,
-      "tp_base_qty": 6
-    },
-    {
-      "code": "066620",
-      "name": "국보디자인",
-      "qty": 4,
-      "avg": 23600,
-      "tp_stage": 0,
-      "tp_base_qty": 4
-    },
-    {
-      "code": "067830",
-      "name": "세이브존I&C",
-      "qty": 30,
-      "avg": 3259,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "069730",
-      "name": "DSR제강",
-      "qty": 2,
-      "avg": 4824,
-      "tp_stage": 0,
-      "tp_base_qty": 3
+      "code": "069540",
+      "name": "빛과전자",
+      "qty": 17,
+      "avg": 2430,
+      "tp_stage": 2,
+      "tp_base_qty": 41
     },
     {
       "code": "072870",
@@ -204,44 +92,44 @@
       "tp_base_qty": 5
     },
     {
-      "code": "079900",
-      "name": "전진건설로봇",
-      "qty": 1,
-      "avg": 57400,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "085620",
-      "name": "미래에셋생명",
-      "qty": 3,
-      "avg": 17380,
-      "tp_stage": 0,
-      "tp_base_qty": 5
-    },
-    {
       "code": "085670",
       "name": "뉴프렉스",
-      "qty": 12,
+      "qty": 6,
       "avg": 5690,
-      "tp_stage": 1,
-      "tp_base_qty": 17
+      "tp_stage": 0,
+      "tp_base_qty": 12
     },
     {
-      "code": "086670",
-      "name": "비엠티",
-      "qty": 3,
-      "avg": 14310,
+      "code": "090350",
+      "name": "노루페인트",
+      "qty": 11,
+      "avg": 8750,
       "tp_stage": 0,
-      "tp_base_qty": 6
+      "tp_base_qty": 11
+    },
+    {
+      "code": "090460",
+      "name": "비에이치",
+      "qty": 4,
+      "avg": 23100,
+      "tp_stage": 0,
+      "tp_base_qty": 4
     },
     {
       "code": "090470",
       "name": "제이스텍",
-      "qty": 3,
+      "qty": 2,
       "avg": 9220,
       "tp_stage": 1,
-      "tp_base_qty": 4
+      "tp_base_qty": 3
+    },
+    {
+      "code": "092220",
+      "name": "KEC",
+      "qty": 60,
+      "avg": 1667,
+      "tp_stage": 0,
+      "tp_base_qty": 60
     },
     {
       "code": "092230",
@@ -250,14 +138,6 @@
       "avg": 81400,
       "tp_stage": 0,
       "tp_base_qty": 1
-    },
-    {
-      "code": "092790",
-      "name": "넥스틸",
-      "qty": 7,
-      "avg": 12560,
-      "tp_stage": 0,
-      "tp_base_qty": 7
     },
     {
       "code": "094840",
@@ -270,7 +150,7 @@
     {
       "code": "094970",
       "name": "제이엠티",
-      "qty": 34,
+      "qty": 9,
       "avg": 2920,
       "tp_stage": 0,
       "tp_base_qty": 34
@@ -278,122 +158,58 @@
     {
       "code": "104480",
       "name": "티케이케미칼",
-      "qty": 33,
+      "qty": 15,
       "avg": 2120,
-      "tp_stage": 1,
-      "tp_base_qty": 47
+      "tp_stage": 2,
+      "tp_base_qty": 33
     },
     {
-      "code": "106240",
-      "name": "파인테크닉스",
-      "qty": 22,
-      "avg": 2280,
-      "tp_stage": 0,
-      "tp_base_qty": 43
-    },
-    {
-      "code": "131030",
-      "name": "옵투스제약",
-      "qty": 8,
-      "avg": 11650,
-      "tp_stage": 0,
-      "tp_base_qty": 8
-    },
-    {
-      "code": "141000",
-      "name": "비아트론",
+      "code": "143240",
+      "name": "사람인",
       "qty": 5,
-      "avg": 10160,
+      "avg": 16670,
       "tp_stage": 0,
-      "tp_base_qty": 9
-    },
-    {
-      "code": "151860",
-      "name": "KG에코솔루션",
-      "qty": 14,
-      "avg": 6730,
-      "tp_stage": 0,
-      "tp_base_qty": 14
+      "tp_base_qty": 5
     },
     {
       "code": "155660",
       "name": "DSR",
-      "qty": 23,
+      "qty": 12,
       "avg": 4185,
       "tp_stage": 0,
       "tp_base_qty": 23
     },
     {
-      "code": "178920",
-      "name": "PI첨단소재",
-      "qty": 1,
-      "avg": 21550,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "183190",
-      "name": "아세아시멘트",
-      "qty": 7,
-      "avg": 12740,
-      "tp_stage": 0,
-      "tp_base_qty": 7
-    },
-    {
-      "code": "308430",
-      "name": "셀비온",
-      "qty": 2,
-      "avg": 31150,
-      "tp_stage": 0,
-      "tp_base_qty": 3
-    },
-    {
-      "code": "311320",
-      "name": "지오엘리먼트",
-      "qty": 9,
-      "avg": 7200,
-      "tp_stage": 0,
-      "tp_base_qty": 9
-    },
-    {
-      "code": "317400",
-      "name": "자이에스앤디",
-      "qty": 21,
-      "avg": 4635,
-      "tp_stage": 0,
-      "tp_base_qty": 21
-    },
-    {
-      "code": "321550",
-      "name": "티움바이오",
+      "code": "187870",
+      "name": "디바이스",
       "qty": 4,
-      "avg": 8570,
-      "tp_stage": 2,
-      "tp_base_qty": 8
+      "avg": 21600,
+      "tp_stage": 0,
+      "tp_base_qty": 4
     },
     {
-      "code": "330860",
-      "name": "네패스아크",
-      "qty": 2,
-      "avg": 21675,
-      "tp_stage": 2,
+      "code": "200470",
+      "name": "에이팩트",
+      "qty": 6,
+      "avg": 9040,
+      "tp_stage": 0,
+      "tp_base_qty": 11
+    },
+    {
+      "code": "200710",
+      "name": "에이디테크놀로지",
+      "qty": 1,
+      "avg": 50000,
+      "tp_stage": 0,
       "tp_base_qty": 2
     },
     {
-      "code": "417840",
-      "name": "저스템",
-      "qty": 9,
-      "avg": 7120,
+      "code": "376180",
+      "name": "피코그램",
+      "qty": 8,
+      "avg": 3263,
       "tp_stage": 0,
-      "tp_base_qty": 9
-    },
-    {
-      "code": "448730",
-      "name": "삼성FN리츠",
-      "qty": 12,
-      "avg": 5400,
-      "tp_stage": 0,
-      "tp_base_qty": 12
+      "tp_base_qty": 2
     }
   ]
 }
