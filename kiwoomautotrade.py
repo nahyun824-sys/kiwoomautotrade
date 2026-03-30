@@ -17,6 +17,7 @@ B안 핵심
 - (B) 체잔(gubun=0)에서 주문상태(913)/거부사유(919) 로그 + 리포트
 - (C) SendOrder ret=0은 "주문요청 성공"으로만 표기(체결 성공 착시 제거)
 20260323 손익로그 추가
+20260330 조건별 수익/리스크 분리
 """
 
 import sys
@@ -37,10 +38,10 @@ from PyQt5.QtCore import QEventLoop, QTimer
 # 사용자 설정
 # =========================
 BUY_COND_NAMES = {"A", "x2", "w3"}
-SELL_COND_NAMES = {"A", "x2", "w3", "w"}
+SELL_COND_NAMES = {"A","A_", "x2", "w3", "w"}
 
-TARGET_BUY_AMOUNT = 70000
-MAX_POSITION_PER_CODE = 70000
+TARGET_BUY_AMOUNT = 50000
+MAX_POSITION_PER_CODE = 50000
 ALLOW_ADD_BUY = False
 
 SELL_DELAY_SEC = 5.0
@@ -50,8 +51,6 @@ STOPLOSS_TIERS = [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)]
 AUTO_SELL_INTERVAL_SEC = 60
 
 TRAILING_STOP_PCT = 8.0
-TRAILING_ENABLED = True
-
 BALANCE_COOLDOWN_SEC = 3.0
 SYNC_INTERVAL_SEC = 15.0
 PRICE_REQ_INTERVAL = 0.25
@@ -104,9 +103,73 @@ HOLDINGS_SNAPSHOT_FILE = "holdings_snapshot.json"
 # === Take-profit (부분익절) ===
 # +10% 도달 시 보유수량의 30% (기준수량=시작/신규편입 시점 수량) 익절
 # +15% 도달 시 보유수량의 30% (기준수량의 30%) 추가 익절
-TAKEPROFIT_ENABLED = True
-TAKEPROFIT_LEVELS = [(8.0, 0.30), (13.0, 0.30)]  # (pnl_pct_threshold, sell_ratio_of_base_qty)
+TAKEPROFIT_LEVELS = [(8.0, 0.50), (13.0, 0.30)]  # (pnl_pct_threshold, sell_ratio_of_base_qty)
 TAKEPROFIT_MIN_QTY = 1
+
+# === Risk feature master switches ===
+STOPLOSS_ENABLED = True
+TAKEPROFIT_ENABLED = True
+TRAILING_ENABLED = True
+
+# === Condition-specific risk config ===
+# - 상단 설정만 바꿔서 조건별 손절/익절/트레일링 on/off 및 수치 조절
+# - 조건별 설정이 없으면 DEFAULT_RISK_CONFIG 사용
+DEFAULT_RISK_CONFIG = {
+    "stoploss_enabled": True,
+    "takeprofit_enabled": True,
+    "trailing_enabled": True,
+    "stoploss_tiers": [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)],
+    "takeprofit_levels": [(8.0, 0.30), (13.0, 0.30)],
+    "takeprofit_min_qty": 1,
+    "trailing_stop_pct": 8.0,
+}
+
+COND_RISK_CONFIG = {
+    "A": {
+        "stoploss_enabled": True,
+        "takeprofit_enabled": True,
+        "trailing_enabled": True,
+        "stoploss_tiers": [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)],
+        "takeprofit_levels": [(8.0, 0.30), (13.0, 0.30)],
+        "takeprofit_min_qty": 1,
+        "trailing_stop_pct": 8.0,
+    },
+    "x2": {
+        "stoploss_enabled": True,
+        "takeprofit_enabled": False,
+        "trailing_enabled": True,
+        "stoploss_tiers": [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)],
+        "takeprofit_levels": [(8.0, 0.30), (13.0, 0.30)],
+        "takeprofit_min_qty": 1,
+        "trailing_stop_pct": 8.0,
+    },
+    "w3": {
+        "stoploss_enabled": True,
+        "takeprofit_enabled": True,
+        "trailing_enabled": True,
+        "stoploss_tiers": [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)],
+        "takeprofit_levels": [(8.0, 0.60), (15.0, 0.20)],
+        "takeprofit_min_qty": 1,
+        "trailing_stop_pct": 8.0,
+    },
+}
+
+# === Condition-specific scheduled force-sell config ===
+# - 상단 설정만 바꿔서 조건별 시간 강제청산 가능
+# - action: SELL_ALL | SELL_PARTIAL
+# - weekdays: ["MON", "TUE", "WED", "THU", "FRI"]
+# - time은 hour/minute 또는 hhmm("1400")로 지정 가능
+# - once_per_day=True 이면 같은 규칙이 하루에 한 번만 발동
+CONDITION_FORCE_SELL_ENABLED = True
+COND_FORCE_SELL_CONFIG = {
+    "A": [
+        # {"weekdays": ["FRI"], "hour": 14, "minute": 0, "action": "SELL_ALL", "reason": "A_FRI_1400_FORCE_EXIT", "once_per_day": True},
+    ],
+    "x2": [{"weekdays": ["FRI"], "hour": 14, "minute": 0, "action": "SELL_ALL", "reason": "A_FRI_1400_FORCE_EXIT", "once_per_day": True}
+    ],
+    "w3": [
+    ],
+}
 
 
 # === 거래 시간 게이트 (KST) ===
@@ -337,6 +400,16 @@ class Kiwoom(QAxWidget):
         # 매도 컨텍스트(ORPHAN/조건이탈 포함) 추적용
         self.pending_sell_meta: Dict[str, Dict[str, Any]] = {}
 
+        # 종목별 최초/주요 진입 조건 저장 (조건별 리스크 설정 참조용)
+        self.buy_condition_by_code: Dict[str, str] = {}
+
+        # Report enhanced: 조건 편입시각 / trade_id 추적
+        self.condition_enter_ts: Dict[Tuple[str, str], float] = {}
+        self.active_trade_id_by_code: Dict[str, str] = {}
+
+        # 조건별 시간 강제청산 중복 방지
+        self.force_sell_fired_today: Set[str] = set()
+
         # orphan
         self.orphan_first_seen: Dict[str, float] = {}
 
@@ -403,7 +476,12 @@ class Kiwoom(QAxWidget):
         self._log("INFO", f"[BOOT-CONFIG] ALLOW_ADD_BUY={ALLOW_ADD_BUY}")
         self._log("INFO", f"[BOOT-CONFIG] SELL_DELAY_SEC={SELL_DELAY_SEC}")
         self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_TIERS={STOPLOSS_TIERS} / AUTO_SELL_INTERVAL_SEC={AUTO_SELL_INTERVAL_SEC}")
+        self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_ENABLED={STOPLOSS_ENABLED} tiers={STOPLOSS_TIERS}")
+        self._log("INFO", f"[BOOT-CONFIG] TAKEPROFIT_ENABLED={TAKEPROFIT_ENABLED} levels={TAKEPROFIT_LEVELS} min_qty={TAKEPROFIT_MIN_QTY}")
         self._log("INFO", f"[BOOT-CONFIG] TRAILING_ENABLED={TRAILING_ENABLED} / TRAILING_STOP_PCT={TRAILING_STOP_PCT}")
+        self._log("INFO", f"[BOOT-CONFIG] DEFAULT_RISK_CONFIG={DEFAULT_RISK_CONFIG}")
+        self._log("INFO", f"[BOOT-CONFIG] COND_RISK_CONFIG={COND_RISK_CONFIG}")
+        self._log("INFO", f"[BOOT-CONFIG] CONDITION_FORCE_SELL_ENABLED={CONDITION_FORCE_SELL_ENABLED} / COND_FORCE_SELL_CONFIG={COND_FORCE_SELL_CONFIG}")
         self._log("INFO", f"[BOOT-CONFIG] REPORT_ENABLED={REPORT_ENABLED} dir={REPORT_DIR} prefix={REPORT_PREFIX} flushN={REPORT_FLUSH_EVERY_N}")
         self._log("INFO", f"[BOOT-CONFIG] PASSWD={'(EMPTY)' if PASSWD=='' else '(SET)'} / PASSWD_MEDIA={PASSWD_MEDIA}")
         self._log("INFO", f"[BOOT-CONFIG] BOUGHT_TODAY_PERSIST={BOUGHT_TODAY_PERSIST} file={BOUGHT_TODAY_FILE}")
@@ -417,16 +495,26 @@ class Kiwoom(QAxWidget):
             "MAX_POSITION_PER_CODE": MAX_POSITION_PER_CODE,
             "ALLOW_ADD_BUY": ALLOW_ADD_BUY,
             "SELL_DELAY_SEC": SELL_DELAY_SEC,
+            "STOPLOSS_ENABLED": STOPLOSS_ENABLED,
             "STOPLOSS_TIERS": STOPLOSS_TIERS,
+            "TAKEPROFIT_ENABLED": TAKEPROFIT_ENABLED,
+            "TAKEPROFIT_LEVELS": TAKEPROFIT_LEVELS,
+            "TAKEPROFIT_MIN_QTY": TAKEPROFIT_MIN_QTY,
             "AUTO_SELL_INTERVAL_SEC": AUTO_SELL_INTERVAL_SEC,
             "TRAILING_ENABLED": TRAILING_ENABLED,
             "TRAILING_STOP_PCT": TRAILING_STOP_PCT,
+            "DEFAULT_RISK_CONFIG": DEFAULT_RISK_CONFIG,
+            "COND_RISK_CONFIG": COND_RISK_CONFIG,
+            "CONDITION_FORCE_SELL_ENABLED": CONDITION_FORCE_SELL_ENABLED,
+            "COND_FORCE_SELL_CONFIG": COND_FORCE_SELL_CONFIG,
         })
 
         if SOLD_TODAY_PERSIST:
             self._load_sold_today()
         if BOUGHT_TODAY_PERSIST:
             self._load_bought_today()
+        if HOLDINGS_SNAPSHOT_ENABLED:
+            self._load_holdings_snapshot()
 
         # timers
         self.buy_timer = QTimer()
@@ -443,6 +531,9 @@ class Kiwoom(QAxWidget):
 
         self.risk_timer = QTimer()
         self.risk_timer.timeout.connect(self._risk_monitor_tick)
+
+        self.force_sell_timer = QTimer()
+        self.force_sell_timer.timeout.connect(self._force_sell_schedule_tick)
 
         # trade window guard
         self._trade_window_last: Optional[bool] = None
@@ -758,6 +849,173 @@ class Kiwoom(QAxWidget):
             return float(CONDITION_CHATTER_EXTRA_DELAY_SEC)
         return 0.0
 
+    def _get_primary_condition_for_code(self, code: str) -> str:
+        code = _norm_code(code)
+        if not code:
+            return ""
+        cond = str(self.buy_condition_by_code.get(code, "") or "").strip()
+        if cond:
+            return cond
+        meta = dict(self.order_meta.get(code, {}) or {})
+        cond = str(meta.get("cond", "") or "").strip()
+        return cond
+
+    def _get_risk_config_for_code(self, code: str) -> Dict[str, Any]:
+        code = _norm_code(code)
+        cond = self._get_primary_condition_for_code(code)
+        cfg = dict(DEFAULT_RISK_CONFIG)
+        cond_cfg = dict(COND_RISK_CONFIG.get(cond, {}) or {})
+        cfg.update(cond_cfg)
+
+        cfg["cond"] = cond
+        cfg["stoploss_enabled"] = bool(STOPLOSS_ENABLED and bool(cfg.get("stoploss_enabled", True)))
+        cfg["takeprofit_enabled"] = bool(TAKEPROFIT_ENABLED and bool(cfg.get("takeprofit_enabled", True)))
+        cfg["trailing_enabled"] = bool(TRAILING_ENABLED and bool(cfg.get("trailing_enabled", True)))
+        cfg["stoploss_tiers"] = list(cfg.get("stoploss_tiers", STOPLOSS_TIERS) or [])
+        cfg["takeprofit_levels"] = list(cfg.get("takeprofit_levels", TAKEPROFIT_LEVELS) or [])
+        cfg["takeprofit_min_qty"] = int(cfg.get("takeprofit_min_qty", TAKEPROFIT_MIN_QTY) or 1)
+        cfg["trailing_stop_pct"] = float(cfg.get("trailing_stop_pct", TRAILING_STOP_PCT) or 0.0)
+        return cfg
+
+    def _weekday_key(self, now: datetime.datetime = None) -> str:
+        if now is None:
+            now = datetime.datetime.now()
+        return ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][now.weekday()]
+
+    def _normalize_force_sell_rule(self, cond: str, rule: Dict[str, Any]) -> Dict[str, Any]:
+        rule = dict(rule or {})
+        weekdays = [str(x).upper() for x in list(rule.get("weekdays", []) or [])]
+        hhmm = str(rule.get("hhmm", "") or "").strip()
+        hour = rule.get("hour", None)
+        minute = rule.get("minute", None)
+        if hhmm and len(hhmm) == 4 and hhmm.isdigit():
+            hour = int(hhmm[:2])
+            minute = int(hhmm[2:])
+        hour = int(hour if hour is not None else 0)
+        minute = int(minute if minute is not None else 0)
+        action = str(rule.get("action", "SELL_ALL") or "SELL_ALL").upper()
+        ratio = float(rule.get("ratio", 1.0) or 1.0)
+        once_per_day = bool(rule.get("once_per_day", True))
+        only_if_profit = bool(rule.get("only_if_profit", False))
+        only_if_loss = bool(rule.get("only_if_loss", False))
+        reason = str(rule.get("reason", "") or "").strip() or f"{cond}_{'_'.join(weekdays) if weekdays else 'ANY'}_{hour:02d}{minute:02d}_{action}"
+        rule_id = str(rule.get("rule_id", "") or "").strip() or reason
+        return {
+            "cond": str(cond or ""),
+            "weekdays": weekdays,
+            "hour": max(0, min(23, hour)),
+            "minute": max(0, min(59, minute)),
+            "action": action,
+            "ratio": ratio,
+            "once_per_day": once_per_day,
+            "only_if_profit": only_if_profit,
+            "only_if_loss": only_if_loss,
+            "reason": reason,
+            "rule_id": rule_id,
+        }
+
+    def _get_force_sell_rules_for_code(self, code: str):
+        code = _norm_code(code)
+        cond = self._get_primary_condition_for_code(code)
+        rules = []
+        for raw in list(COND_FORCE_SELL_CONFIG.get(cond, []) or []):
+            try:
+                rules.append(self._normalize_force_sell_rule(cond, raw))
+            except Exception as e:
+                self._log("WARN", f"[FORCE-SELL] invalid rule cond={cond} raw={raw} err={e}", key=f"FORCE_RULE_BAD_{cond}", throttle=5.0)
+        return cond, rules
+
+    def _make_force_sell_fire_key(self, code: str, rule: Dict[str, Any], now: datetime.datetime = None) -> str:
+        if now is None:
+            now = datetime.datetime.now()
+        return f"{now.strftime('%Y%m%d')}|{_norm_code(code)}|{str(rule.get('rule_id', ''))}"
+
+    def _force_sell_rule_is_due(self, rule: Dict[str, Any], now: datetime.datetime = None) -> bool:
+        if now is None:
+            now = datetime.datetime.now()
+        weekdays = list(rule.get("weekdays", []) or [])
+        if weekdays and self._weekday_key(now) not in weekdays:
+            return False
+        rule_hhmm = int(rule.get("hour", 0)) * 100 + int(rule.get("minute", 0))
+        now_hhmm = now.hour * 100 + now.minute
+        return now_hhmm >= rule_hhmm
+
+    def _force_sell_schedule_tick(self):
+        if not self._in_trade_window():
+            return
+        if not CONDITION_FORCE_SELL_ENABLED:
+            return
+        if self._risk_running:
+            return
+        if not self.holdings_qty:
+            return
+
+        now = datetime.datetime.now()
+        today_prefix = now.strftime('%Y%m%d') + "|"
+        stale = [x for x in list(self.force_sell_fired_today) if not str(x).startswith(today_prefix)]
+        for k in stale:
+            self.force_sell_fired_today.discard(k)
+
+        for code, qty in list(self.holdings_qty.items()):
+            code = _norm_code(code)
+            qty = int(qty or 0)
+            if not code or qty <= 0:
+                continue
+            if code in self.pending_codes or self._has_pending_sell(code):
+                continue
+
+            cond, rules = self._get_force_sell_rules_for_code(code)
+            if not cond or not rules:
+                continue
+
+            snap = None
+            for rule in rules:
+                if not self._force_sell_rule_is_due(rule, now=now):
+                    continue
+
+                fire_key = self._make_force_sell_fire_key(code, rule, now=now)
+                if bool(rule.get("once_per_day", True)) and fire_key in self.force_sell_fired_today:
+                    continue
+
+                if snap is None:
+                    snap = self._build_sell_context_snapshot(code)
+                est_pnl_amt = int(snap.get("est_pnl_amt", 0) or 0)
+                if bool(rule.get("only_if_profit", False)) and est_pnl_amt <= 0:
+                    continue
+                if bool(rule.get("only_if_loss", False)) and est_pnl_amt >= 0:
+                    continue
+
+                reason = str(rule.get("reason", "FORCE_SELL") or "FORCE_SELL")
+                action = str(rule.get("action", "SELL_ALL") or "SELL_ALL").upper()
+                extra = {
+                    "source": "CONDITION_FORCE_SELL",
+                    "cond": cond,
+                    "rule_id": str(rule.get("rule_id", "") or ""),
+                    "weekday": self._weekday_key(now),
+                    "scheduled_hhmm": f"{int(rule.get('hour', 0)):02d}{int(rule.get('minute', 0)):02d}",
+                    "only_if_profit": bool(rule.get("only_if_profit", False)),
+                    "only_if_loss": bool(rule.get("only_if_loss", False)),
+                }
+
+                fired = False
+                if action == "SELL_PARTIAL":
+                    ratio = float(rule.get("ratio", 1.0) or 1.0)
+                    sell_qty = max(1, min(qty, int(qty * ratio)))
+                    self._request_sell_qty(code, sell_qty, reason=reason, price_hint=int(snap.get("cur", 0) or 0), extra=extra)
+                    fired = bool(code in self.pending_codes or self._has_pending_sell(code))
+                else:
+                    self._request_sell_all(code, reason=reason, price_hint=int(snap.get("cur", 0) or 0), extra=extra)
+                    fired = bool(code in self.pending_codes or self._has_pending_sell(code))
+
+                if fired:
+                    self.force_sell_fired_today.add(fire_key)
+                    self._log("INFO", f"[FORCE-SELL] fired: {self._code_tag(code)} cond={cond} action={action} reason={reason}", key=f"FORCE_SELL_FIRE_{code}_{reason}", throttle=0.0)
+                    self.report.emit("FORCE_SELL_FIRED", {"code": code, "cond": cond, "action": action, "reason": reason, "rule": rule, "snapshot": snap})
+                else:
+                    self._log("WARN", f"[FORCE-SELL] trigger but order not sent: {self._code_tag(code)} cond={cond} action={action} reason={reason}", key=f"FORCE_SELL_NOFIRE_{code}_{reason}", throttle=2.0)
+                    self.report.emit("FORCE_SELL_NOT_FIRED", {"code": code, "cond": cond, "action": action, "reason": reason, "rule": rule, "snapshot": snap})
+                break
+
     # -----------------------
     # Trade window gate (KST)
     # -----------------------
@@ -787,6 +1045,7 @@ class Kiwoom(QAxWidget):
         self.orphan_timer.start(int(ORPHAN_CHECK_INTERVAL_SEC * 1000))
         self.sync_timer.start(int(max(5, float(SYNC_INTERVAL_SEC)) * 1000))
         self.risk_timer.start(int(max(5, int(AUTO_SELL_INTERVAL_SEC)) * 1000))
+        self.force_sell_timer.start(5000)
         self.price_queue_timer.start(150)
 
     def _stop_all_conditions(self):
@@ -810,6 +1069,7 @@ class Kiwoom(QAxWidget):
             self.orphan_timer.stop()
             self.sync_timer.stop()
             self.risk_timer.stop()
+            self.force_sell_timer.stop()
             self.price_queue_timer.stop()
         except Exception:
             pass
@@ -1109,7 +1369,9 @@ class Kiwoom(QAxWidget):
 
         if cond_name in BUY_COND_NAMES:
             for c in codes:
-                queued, reason = self._enqueue_buy(_norm_code(c), cond_name, ev="INITIAL_TRCOND")
+                cc = _norm_code(c)
+                self.condition_enter_ts.setdefault((cc, cond_name), time.time())
+                queued, reason = self._enqueue_buy(cc, cond_name, ev="INITIAL_TRCOND")
                 if not queued:
                     cc = _norm_code(c)
                     self._log("INFO", f"[COND-INIT] 미매수(큐 등록 실패): {self._code_tag(cc)} cond={cond_name} reason={reason}",
@@ -1126,8 +1388,9 @@ class Kiwoom(QAxWidget):
         extra_delay = self._track_condition_toggle(code, cond_name, event_type)
 
         if event_type == "I":
+            self.condition_enter_ts[(code, cond_name)] = time.time()
             self._log("INFO", f"[COND-REAL] cond={cond_name} 편입(I): {self._code_tag(code)}", key=f"COND_I_{cond_name}_{code}", throttle=0.5)
-            self.report.emit("COND_REAL_I", {"cond": cond_name, "code": code, "idx": int(cond_index)})
+            self.report.emit("COND_REAL_I", {"cond": cond_name, "code": code, "idx": int(cond_index), "condition_enter_ts": _now_iso()})
             if cond_name in SELL_COND_NAMES:
                 self.sell_cond_members[cond_name].add(code)
             if cond_name in BUY_COND_NAMES:
@@ -1137,8 +1400,10 @@ class Kiwoom(QAxWidget):
                     self.report.emit("COND_REAL_I_NOBUY", {"cond": cond_name, "code": _norm_code(code), "reason": reason})
 
         elif event_type == "D":
+            duration_sec = self._get_condition_duration_sec(code, cond_name)
             self._log("INFO", f"[COND-REAL] cond={cond_name} 이탈(D): {self._code_tag(code)}", key=f"COND_D_{cond_name}_{code}", throttle=0.5)
-            self.report.emit("COND_REAL_D", {"cond": cond_name, "code": code, "idx": int(cond_index)})
+            self.report.emit("COND_REAL_D", {"cond": cond_name, "code": code, "idx": int(cond_index), "condition_duration_sec": float(duration_sec)})
+            self.condition_enter_ts.pop((code, cond_name), None)
             if cond_name in SELL_COND_NAMES:
                 self.sell_cond_members[cond_name].discard(code)
 
@@ -1403,6 +1668,9 @@ class Kiwoom(QAxWidget):
         for code in list(self.stoploss_base_qty.keys()):
             if self.holdings_qty.get(code, 0) <= 0:
                 self.stoploss_base_qty.pop(code, None)
+        for code in list(self.buy_condition_by_code.keys()):
+            if self.holdings_qty.get(code, 0) <= 0:
+                self.buy_condition_by_code.pop(code, None)
         for code in list(self.rebuy_block_pending):
             if self.holdings_qty.get(code, 0) <= 0:
                 self.rebuy_block_pending.discard(code)
@@ -1593,6 +1861,11 @@ class Kiwoom(QAxWidget):
                         if BOUGHT_TODAY_PERSIST:
                             self._save_bought_today()
 
+                    if not self.buy_condition_by_code.get(code):
+                        last_cond = str((self.order_meta.get(code, {}) or {}).get("cond", "") or "").strip()
+                        if last_cond:
+                            self.buy_condition_by_code[code] = last_cond
+
                     # take-profit base qty init (체잔 신규편입 시점 수량을 기준으로 고정)
                     if int(self.tp_base_qty.get(code, 0) or 0) <= 0:
                         self.tp_base_qty[code] = int(qty)
@@ -1600,6 +1873,19 @@ class Kiwoom(QAxWidget):
 
                     if before_qty <= 0:
                         self._set_order_state(code, "BUY_FILLED", side="BUY", holding_qty=int(qty), avg=int(avg or 0))
+                        trade_id = str(self.active_trade_id_by_code.get(code, "") or self._make_trade_id(code))
+                        self.active_trade_id_by_code[code] = trade_id
+                        cond_name = str(self.buy_condition_by_code.get(code, "") or str((self.order_meta.get(code, {}) or {}).get("cond", "")) or "")
+                        duration_sec = self._get_condition_duration_sec(code, cond_name)
+                        self.report.emit("BUY_FILLED_EVENT", {
+                            "code": code,
+                            "trade_id": trade_id,
+                            "condition": cond_name,
+                            "condition_duration_sec": float(duration_sec),
+                            "qty": int(qty),
+                            "avg": int(avg or 0),
+                            "name": name,
+                        })
                     else:
                         cur_state = str(self.order_state.get(code, ""))
                         if cur_state.startswith("SELL_"):
@@ -1626,6 +1912,8 @@ class Kiwoom(QAxWidget):
 
                     self.tp_stage.pop(code, None)
                     self.tp_base_qty.pop(code, None)
+                    self.buy_condition_by_code.pop(code, None)
+                    self.active_trade_id_by_code.pop(code, None)
                     self._set_order_state(code, "SELL_FILLED", side="SELL", holding_qty=0)
                     self._clear_pending_sell_context(code, why="HOLDING_QTY_ZERO")
                     self._save_holdings_snapshot(reason="CHEJAN_HOLDING_ZERO")
@@ -1649,6 +1937,37 @@ class Kiwoom(QAxWidget):
             return self.last_buy_block_reason.get(code, "")
         except Exception:
             return ""
+
+    def _make_trade_id(self, code: str) -> str:
+        code = _norm_code(code)
+        now = datetime.datetime.now()
+        return f"{code}_{now.strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
+
+    def _get_condition_duration_sec(self, code: str, cond: str) -> float:
+        code = _norm_code(code)
+        cond = str(cond or "").strip()
+        if not code or not cond:
+            return 0.0
+        ts = float(self.condition_enter_ts.get((code, cond), 0.0) or 0.0)
+        if ts <= 0:
+            return 0.0
+        return max(0.0, time.time() - ts)
+
+    def _normalize_exit_reason(self, reason: str) -> str:
+        s = str(reason or "").upper()
+        if "STOPLOSS" in s:
+            return "STOPLOSS"
+        if s.startswith("TP") or "TAKEPROFIT" in s:
+            return "TAKEPROFIT"
+        if "TRAILING" in s:
+            return "TRAILING_STOP"
+        if "ORPHAN" in s:
+            return "ORPHAN"
+        if "FORCE" in s:
+            return "FORCE_SELL"
+        if "EXIT_" in s or "COND_EXIT" in s:
+            return "CONDITION_EXIT"
+        return "OTHER"
 
     def _build_sell_context_snapshot(self, code: str, price_hint: int = 0) -> Dict[str, Any]:
         code = _norm_code(code)
@@ -1688,6 +2007,8 @@ class Kiwoom(QAxWidget):
         snap = self._build_sell_context_snapshot(code, price_hint=price_hint)
         meta = {
             "reason": str(reason or ""),
+            "exit_reason": self._normalize_exit_reason(reason),
+            "trade_id": str(self.active_trade_id_by_code.get(code, "") or ""),
             "mode": str(mode or ""),
             "req_qty": int(qty or 0),
             "snapshot_ts": _now_iso(),
@@ -1739,9 +2060,11 @@ class Kiwoom(QAxWidget):
         )
         self.report.emit("SELL_FILL_RESULT", {
             "code": code,
+            "trade_id": str(meta.get("trade_id", self.active_trade_id_by_code.get(code, "")) or ""),
             "order_no": str(order_no or ""),
             "bs": str(bs or ""),
             "reason": reason,
+            "exit_reason": str(meta.get("exit_reason", self._normalize_exit_reason(reason)) or "OTHER"),
             "fill_qty": int(fill_qty),
             "fill_price": int(fill_price),
             "avg": int(avg),
@@ -1927,6 +2250,8 @@ class Kiwoom(QAxWidget):
                 self.report.emit("BOUGHT_TODAY_ADD", {"code": code, "via": "BUY_SENT_PRE_CHEJAN"})
 
             self._register_sent_order(code, "BUY", qty, price, reason="BUY", cond=cond, reserved_amount=order_amount, pre_bought_added=pre_bought_added)
+            self.buy_condition_by_code[code] = str(cond or "")
+            self._save_holdings_snapshot(reason="BUY_SENT_COND_TRACK")
             self.report.emit("BUY_SENT", {"code": code, "cond": cond, "qty": qty, "price": price, "order_amount": order_amount,
                                           "reserved_exposure": int(self.reserved_exposure.get(code, 0) or 0), "pre_bought_added": bool(pre_bought_added)})
         else:
@@ -2183,12 +2508,6 @@ class Kiwoom(QAxWidget):
             if not self.holdings_qty:
                 return
 
-            try:
-                tiers = list(STOPLOSS_TIERS) if isinstance(STOPLOSS_TIERS, (list, tuple)) else []
-                tiers = sorted(tiers, key=lambda x: float(x[0]), reverse=True)  # -3 > -5 > -7
-            except Exception:
-                tiers = [(-3.0, 0.30), (-5.0, 0.50), (-7.0, 1.00)]
-
             for code, qty in list(self.holdings_qty.items()):
                 qty = int(qty or 0)
                 if qty <= 0:
@@ -2210,6 +2529,21 @@ class Kiwoom(QAxWidget):
                     self._metric_inc("risk_skip_pending_sell", reason=code)
                     continue
 
+                cfg = self._get_risk_config_for_code(code)
+                cond_name = str(cfg.get("cond", "") or "")
+                try:
+                    tiers = list(cfg.get("stoploss_tiers", []) or [])
+                    tiers = sorted(tiers, key=lambda x: float(x[0]), reverse=True)
+                except Exception:
+                    tiers = []
+                try:
+                    tp_levels = list(cfg.get("takeprofit_levels", []) or [])
+                    tp_levels = sorted(tp_levels, key=lambda x: float(x[0]))
+                except Exception:
+                    tp_levels = []
+                tp_min_qty = max(1, int(cfg.get("takeprofit_min_qty", TAKEPROFIT_MIN_QTY) or 1))
+                trailing_stop_pct = abs(float(cfg.get("trailing_stop_pct", TRAILING_STOP_PCT) or 0.0))
+
                 cur = self.request_price(code)
                 if (not cur or cur <= 0):
                     cur = self._get_cached_price(code, max_age_sec=PRICE_CACHE_HARD_TTL_SEC)
@@ -2224,7 +2558,7 @@ class Kiwoom(QAxWidget):
                     continue
 
                 peak = int(self.peak_price.get(code, 0) or 0)
-                if TRAILING_ENABLED:
+                if bool(cfg.get("trailing_enabled", False)):
                     if peak <= 0 or cur > peak:
                         self.peak_price[code] = cur
                         peak = cur
@@ -2233,7 +2567,7 @@ class Kiwoom(QAxWidget):
                 stage = int(self.stoploss_stage.get(code, 0) or 0)
 
                 # 1) STOPLOSS tiers (한 tick에 한 단계만)
-                if tiers and stage < len(tiers):
+                if bool(cfg.get("stoploss_enabled", False)) and tiers and stage < len(tiers):
                     thr_pct, ratio = tiers[stage]
                     if pnl_pct <= float(thr_pct):
                         if code not in self.stoploss_base_qty:
@@ -2262,7 +2596,7 @@ class Kiwoom(QAxWidget):
                         self.report.emit("STOPLOSS_FIRE", {
                             "code": code, "cur": cur, "avg": avg, "pnl_pct": pnl_pct,
                             "stage": stage, "thr_pct": float(thr_pct), "ratio": float(ratio),
-                            "sell_qty": int(sell_qty), "cur_qty": int(cur_qty),
+                            "sell_qty": int(sell_qty), "cur_qty": int(cur_qty), "cond": cond_name,
                         })
 
                         if sell_qty >= cur_qty:
@@ -2274,9 +2608,9 @@ class Kiwoom(QAxWidget):
                         continue
 
                 # 2) TRAILING (즉시 전량)
-                if TRAILING_ENABLED and peak > 0:
+                if bool(cfg.get("trailing_enabled", False)) and peak > 0 and trailing_stop_pct > 0:
                     drawdown_pct = (float(cur - peak) / float(peak)) * 100.0
-                    if drawdown_pct <= -abs(float(TRAILING_STOP_PCT)):
+                    if drawdown_pct <= -abs(float(trailing_stop_pct)):
                         self._log(
                             "INFO",
                             f"[RISK] TRAILING 발동: {self._code_tag(code)} cur={cur} peak={peak} dd={drawdown_pct:.2f}%",
@@ -2286,17 +2620,13 @@ class Kiwoom(QAxWidget):
                         self._clear_delayed_sells_code(code)
                         self.report.emit("TRAILING_FIRE", {
                             "code": code, "cur": cur, "peak": peak,
-                            "drawdown_pct": drawdown_pct, "trail_pct": float(TRAILING_STOP_PCT)
+                            "drawdown_pct": drawdown_pct, "trail_pct": float(trailing_stop_pct), "cond": cond_name
                         })
-                        self._request_sell_all(code, reason=f"TRAILING_{TRAILING_STOP_PCT:.0f}", price_hint=cur, extra={"source": "TRAILING", "trail_pct": float(TRAILING_STOP_PCT), "peak": int(peak)})
+                        self._request_sell_all(code, reason=f"TRAILING_{trailing_stop_pct:.0f}", price_hint=cur, extra={"source": "TRAILING", "trail_pct": float(trailing_stop_pct), "peak": int(peak), "cond": cond_name})
                         continue
                 # 3) TAKEPROFIT (부분익절): +10% 30%, +15% 30% (기준수량의 30%)
-                if TAKEPROFIT_ENABLED:
-                    try:
-                        levels = list(TAKEPROFIT_LEVELS) if isinstance(TAKEPROFIT_LEVELS, (list, tuple)) else []
-                        levels = sorted(levels, key=lambda x: float(x[0]))  # 10 -> 15
-                    except Exception:
-                        levels = [(10.0, 0.30), (15.0, 0.30)]
+                if bool(cfg.get("takeprofit_enabled", False)):
+                    levels = tp_levels
 
                     tp_stage = int(self.tp_stage.get(code, 0) or 0)
                     if tp_stage < len(levels):
@@ -2312,7 +2642,7 @@ class Kiwoom(QAxWidget):
                                     base_qty = int(qty)
 
                                 sell_qty = int(base_qty * float(ratio))
-                                sell_qty = max(int(TAKEPROFIT_MIN_QTY), sell_qty)
+                                sell_qty = max(int(tp_min_qty), sell_qty)
                                 sell_qty = max(1, min(int(qty), int(sell_qty)))
 
                                 self._log(
@@ -2392,6 +2722,8 @@ class Kiwoom(QAxWidget):
                 "name": self._get_code_name(code),
                 "qty": qty,
                 "avg": int(self.holdings_avg.get(code, 0) or 0),
+                "buy_cond": str(self.buy_condition_by_code.get(code, "") or ""),
+                "trade_id": str(self.active_trade_id_by_code.get(code, "") or ""),
                 "tp_stage": int(self.tp_stage.get(code, 0) or 0),
                 "tp_base_qty": int(self.tp_base_qty.get(code, 0) or 0),
             })
@@ -2407,7 +2739,7 @@ class Kiwoom(QAxWidget):
             return
         try:
             snap = self._make_holdings_snapshot()
-            sig = tuple((x["code"], int(x["qty"]), int(x["avg"]), int(x.get("tp_stage", 0)), int(x.get("tp_base_qty", 0)))
+            sig = tuple((x["code"], int(x["qty"]), int(x["avg"]), str(x.get("buy_cond", "")), str(x.get("trade_id", "")), int(x.get("tp_stage", 0)), int(x.get("tp_base_qty", 0)))
                         for x in snap.get("holdings", []))
             if (not force) and (sig == self._holdings_snapshot_sig):
                 return
@@ -2425,6 +2757,43 @@ class Kiwoom(QAxWidget):
             self._log("WARN", f"[HOLDINGS] snapshot save failed: {e}", key="HOLD_SNAP_FAIL", throttle=2.0)
             try:
                 self.report.emit("HOLDINGS_SNAPSHOT_SAVE_FAIL", {"err": repr(e), "reason": reason})
+            except Exception:
+                pass
+
+    def _load_holdings_snapshot(self):
+        try:
+            if not os.path.exists(HOLDINGS_SNAPSHOT_FILE):
+                return
+            with open(HOLDINGS_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            day = str(data.get("day", "") or "")
+            if day != _today_yyyymmdd():
+                return
+            loaded = 0
+            for item in list(data.get("holdings", []) or []):
+                code = _norm_code(item.get("code", ""))
+                if not code:
+                    continue
+                cond = str(item.get("buy_cond", "") or "").strip()
+                if cond:
+                    self.buy_condition_by_code[code] = cond
+                trade_id = str(item.get("trade_id", "") or "").strip()
+                if trade_id:
+                    self.active_trade_id_by_code[code] = trade_id
+                tp_stage = int(item.get("tp_stage", 0) or 0)
+                tp_base_qty = int(item.get("tp_base_qty", 0) or 0)
+                if tp_stage > 0:
+                    self.tp_stage[code] = tp_stage
+                if tp_base_qty > 0:
+                    self.tp_base_qty[code] = tp_base_qty
+                loaded += 1
+            if loaded > 0:
+                self._log("INFO", f"[HOLDINGS] snapshot load: {loaded}개 buy_condition/tp 복원", key="HOLD_SNAP_LOAD", throttle=0.0)
+                self.report.emit("HOLDINGS_SNAPSHOT_LOADED", {"count": int(loaded), "file": HOLDINGS_SNAPSHOT_FILE})
+        except Exception as e:
+            self._log("WARN", f"[HOLDINGS] snapshot load failed: {e}", key="HOLD_SNAP_LOAD_FAIL", throttle=2.0)
+            try:
+                self.report.emit("HOLDINGS_SNAPSHOT_LOAD_FAIL", {"err": repr(e)})
             except Exception:
                 pass
 
