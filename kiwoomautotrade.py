@@ -18,6 +18,8 @@ B안 핵심
 - (C) SendOrder ret=0은 "주문요청 성공"으로만 표기(체결 성공 착시 제거)
 20260323 손익로그 추가
 20260330 조건별 수익/리스크 분리
+20260331 스탑로스 중복 제거
+
 """
 
 import sys
@@ -47,7 +49,6 @@ ALLOW_ADD_BUY = False
 SELL_DELAY_SEC = 5.0
 REBUY_COOLDOWN_SEC = 600.0
 
-STOPLOSS_TIERS = [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)]
 AUTO_SELL_INTERVAL_SEC = 60
 
 TRAILING_STOP_PCT = 8.0
@@ -475,8 +476,8 @@ class Kiwoom(QAxWidget):
         self._log("INFO", f"[BOOT-CONFIG] MAX_POSITION_PER_CODE={MAX_POSITION_PER_CODE}")
         self._log("INFO", f"[BOOT-CONFIG] ALLOW_ADD_BUY={ALLOW_ADD_BUY}")
         self._log("INFO", f"[BOOT-CONFIG] SELL_DELAY_SEC={SELL_DELAY_SEC}")
-        self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_TIERS={STOPLOSS_TIERS} / AUTO_SELL_INTERVAL_SEC={AUTO_SELL_INTERVAL_SEC}")
-        self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_ENABLED={STOPLOSS_ENABLED} tiers={STOPLOSS_TIERS}")
+        self._log("INFO", f"[BOOT-CONFIG] AUTO_SELL_INTERVAL_SEC={AUTO_SELL_INTERVAL_SEC}")
+        self._log("INFO", f"[BOOT-CONFIG] STOPLOSS_ENABLED={STOPLOSS_ENABLED} default_tiers={DEFAULT_RISK_CONFIG.get('stoploss_tiers', [])}")
         self._log("INFO", f"[BOOT-CONFIG] TAKEPROFIT_ENABLED={TAKEPROFIT_ENABLED} levels={TAKEPROFIT_LEVELS} min_qty={TAKEPROFIT_MIN_QTY}")
         self._log("INFO", f"[BOOT-CONFIG] TRAILING_ENABLED={TRAILING_ENABLED} / TRAILING_STOP_PCT={TRAILING_STOP_PCT}")
         self._log("INFO", f"[BOOT-CONFIG] DEFAULT_RISK_CONFIG={DEFAULT_RISK_CONFIG}")
@@ -496,7 +497,6 @@ class Kiwoom(QAxWidget):
             "ALLOW_ADD_BUY": ALLOW_ADD_BUY,
             "SELL_DELAY_SEC": SELL_DELAY_SEC,
             "STOPLOSS_ENABLED": STOPLOSS_ENABLED,
-            "STOPLOSS_TIERS": STOPLOSS_TIERS,
             "TAKEPROFIT_ENABLED": TAKEPROFIT_ENABLED,
             "TAKEPROFIT_LEVELS": TAKEPROFIT_LEVELS,
             "TAKEPROFIT_MIN_QTY": TAKEPROFIT_MIN_QTY,
@@ -871,7 +871,7 @@ class Kiwoom(QAxWidget):
         cfg["stoploss_enabled"] = bool(STOPLOSS_ENABLED and bool(cfg.get("stoploss_enabled", True)))
         cfg["takeprofit_enabled"] = bool(TAKEPROFIT_ENABLED and bool(cfg.get("takeprofit_enabled", True)))
         cfg["trailing_enabled"] = bool(TRAILING_ENABLED and bool(cfg.get("trailing_enabled", True)))
-        cfg["stoploss_tiers"] = list(cfg.get("stoploss_tiers", STOPLOSS_TIERS) or [])
+        cfg["stoploss_tiers"] = list(cfg.get("stoploss_tiers", DEFAULT_RISK_CONFIG.get("stoploss_tiers", [])) or [])
         cfg["takeprofit_levels"] = list(cfg.get("takeprofit_levels", TAKEPROFIT_LEVELS) or [])
         cfg["takeprofit_min_qty"] = int(cfg.get("takeprofit_min_qty", TAKEPROFIT_MIN_QTY) or 1)
         cfg["trailing_stop_pct"] = float(cfg.get("trailing_stop_pct", TRAILING_STOP_PCT) or 0.0)

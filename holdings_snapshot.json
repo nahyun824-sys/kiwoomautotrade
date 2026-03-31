@@ -1,215 +1,87 @@
 {
-  "day": "20260330",
-  "ts": "2026-03-30T15:14:30",
+  "day": "20260331",
+  "ts": "2026-03-31T15:18:03",
   "account": "5065410811",
   "holdings": [
     {
-      "code": "003690",
-      "name": "코리안리",
-      "qty": 3,
-      "avg": 13430,
+      "code": "003280",
+      "name": "흥아해운",
+      "qty": 13,
+      "avg": 3755,
+      "buy_cond": "A",
+      "trade_id": "003280_20260331_141534_522",
       "tp_stage": 0,
-      "tp_base_qty": 3
+      "tp_base_qty": 13
     },
     {
-      "code": "010660",
-      "name": "화천기계",
-      "qty": 8,
-      "avg": 6250,
-      "tp_stage": 0,
-      "tp_base_qty": 8
-    },
-    {
-      "code": "013700",
-      "name": "까뮤이앤씨",
-      "qty": 38,
-      "avg": 1300,
-      "tp_stage": 0,
-      "tp_base_qty": 38
-    },
-    {
-      "code": "015230",
-      "name": "대창단조",
-      "qty": 7,
-      "avg": 6710,
-      "tp_stage": 0,
-      "tp_base_qty": 7
-    },
-    {
-      "code": "037230",
-      "name": "한국팩키지",
-      "qty": 7,
-      "avg": 2875,
-      "tp_stage": 2,
-      "tp_base_qty": 17
-    },
-    {
-      "code": "038950",
-      "name": "파인디지털",
-      "qty": 15,
-      "avg": 3320,
-      "tp_stage": 0,
-      "tp_base_qty": 15
-    },
-    {
-      "code": "049080",
-      "name": "기가레인",
-      "qty": 28,
-      "avg": 1249,
-      "tp_stage": 1,
-      "tp_base_qty": 40
-    },
-    {
-      "code": "052460",
-      "name": "아이크래프트",
-      "qty": 7,
-      "avg": 3565,
-      "tp_stage": 0,
-      "tp_base_qty": 14
-    },
-    {
-      "code": "053690",
-      "name": "한미글로벌",
-      "qty": 1,
-      "avg": 30025,
-      "tp_stage": 0,
-      "tp_base_qty": 1
-    },
-    {
-      "code": "054090",
-      "name": "삼진엘앤디",
-      "qty": 7,
-      "avg": 1272,
-      "tp_stage": 0,
-      "tp_base_qty": 39
-    },
-    {
-      "code": "055490",
-      "name": "테이팩스",
-      "qty": 1,
-      "avg": 16820,
-      "tp_stage": 0,
-      "tp_base_qty": 2
-    },
-    {
-      "code": "058110",
-      "name": "멕아이씨에스",
-      "qty": 19,
-      "avg": 2665,
-      "tp_stage": 0,
-      "tp_base_qty": 19
-    },
-    {
-      "code": "063760",
-      "name": "이엘피",
-      "qty": 19,
-      "avg": 2570,
-      "tp_stage": 0,
-      "tp_base_qty": 19
-    },
-    {
-      "code": "093050",
-      "name": "LF",
-      "qty": 2,
-      "avg": 24350,
-      "tp_stage": 0,
-      "tp_base_qty": 2
-    },
-    {
-      "code": "094970",
-      "name": "제이엠티",
-      "qty": 16,
-      "avg": 3105,
-      "tp_stage": 0,
-      "tp_base_qty": 16
-    },
-    {
-      "code": "104480",
-      "name": "티케이케미칼",
+      "code": "005880",
+      "name": "대한해운",
       "qty": 10,
-      "avg": 2465,
+      "avg": 2440,
+      "buy_cond": "A",
+      "trade_id": "005880_20260331_150140_395",
       "tp_stage": 0,
       "tp_base_qty": 20
     },
     {
-      "code": "125210",
-      "name": "아모그린텍",
-      "qty": 6,
-      "avg": 7790,
+      "code": "008350",
+      "name": "남선알미늄",
+      "qty": 28,
+      "avg": 1749,
+      "buy_cond": "w3",
+      "trade_id": "008350_20260331_092522_911",
       "tp_stage": 0,
-      "tp_base_qty": 6
+      "tp_base_qty": 28
     },
     {
-      "code": "126600",
-      "name": "BGF에코머티리얼즈",
-      "qty": 10,
-      "avg": 4730,
+      "code": "018470",
+      "name": "조일알미늄",
+      "qty": 16,
+      "avg": 1536,
+      "buy_cond": "A",
+      "trade_id": "018470_20260331_092554_989",
       "tp_stage": 0,
-      "tp_base_qty": 10
+      "tp_base_qty": 32
     },
     {
-      "code": "137080",
-      "name": "나래나노텍",
-      "qty": 7,
-      "avg": 5120,
-      "tp_stage": 1,
-      "tp_base_qty": 9
-    },
-    {
-      "code": "143240",
-      "name": "사람인",
-      "qty": 5,
-      "avg": 16670,
+      "code": "037760",
+      "name": "쎄니트",
+      "qty": 24,
+      "avg": 2010,
+      "buy_cond": "A",
+      "trade_id": "037760_20260331_093052_423",
       "tp_stage": 0,
-      "tp_base_qty": 5
+      "tp_base_qty": 24
     },
     {
-      "code": "143540",
-      "name": "영우디에스피",
-      "qty": 36,
-      "avg": 1369,
+      "code": "044450",
+      "name": "KSS해운",
+      "qty": 2,
+      "avg": 11120,
+      "buy_cond": "A",
+      "trade_id": "044450_20260331_143338_281",
       "tp_stage": 0,
-      "tp_base_qty": 1
+      "tp_base_qty": 4
     },
     {
-      "code": "161000",
-      "name": "애경케미칼",
+      "code": "105330",
+      "name": "케이엔더블유",
       "qty": 1,
-      "avg": 12890,
+      "avg": 8350,
+      "buy_cond": "w3",
+      "trade_id": "105330_20260331_103809_794",
       "tp_stage": 2,
-      "tp_base_qty": 3
-    },
-    {
-      "code": "180400",
-      "name": "DXVX",
-      "qty": 9,
-      "avg": 5080,
-      "tp_stage": 0,
-      "tp_base_qty": 9
-    },
-    {
-      "code": "224060",
-      "name": "더코디",
-      "qty": 7,
-      "avg": 6470,
-      "tp_stage": 0,
-      "tp_base_qty": 7
-    },
-    {
-      "code": "241790",
-      "name": "티이엠씨씨엔에스",
-      "qty": 6,
-      "avg": 7860,
-      "tp_stage": 0,
-      "tp_base_qty": 6
-    },
-    {
-      "code": "331920",
-      "name": "셀레믹스",
-      "qty": 5,
-      "avg": 10010,
-      "tp_stage": 0,
       "tp_base_qty": 5
+    },
+    {
+      "code": "106240",
+      "name": "파인테크닉스",
+      "qty": 11,
+      "avg": 2350,
+      "buy_cond": "A",
+      "trade_id": "106240_20260331_094019_319",
+      "tp_stage": 0,
+      "tp_base_qty": 21
     }
   ]
 }
