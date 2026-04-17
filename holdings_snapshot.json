@@ -1,87 +1,477 @@
 {
-  "day": "20260331",
-  "ts": "2026-03-31T15:18:03",
+  "day": "20260416",
+  "ts": "2026-04-16T15:05:48",
   "account": "5065410811",
   "holdings": [
     {
-      "code": "003280",
-      "name": "흥아해운",
-      "qty": 13,
-      "avg": 3755,
-      "buy_cond": "A",
-      "trade_id": "003280_20260331_141534_522",
+      "code": "001020",
+      "name": "페이퍼코리아",
+      "qty": 71,
+      "avg": 704,
+      "buy_cond": "x2",
+      "trade_id": "001020_20260416_120128_398",
       "tp_stage": 0,
-      "tp_base_qty": 13
+      "tp_base_qty": 71
     },
     {
-      "code": "005880",
-      "name": "대한해운",
-      "qty": 10,
-      "avg": 2440,
-      "buy_cond": "A",
-      "trade_id": "005880_20260331_150140_395",
-      "tp_stage": 0,
-      "tp_base_qty": 20
-    },
-    {
-      "code": "008350",
-      "name": "남선알미늄",
-      "qty": 28,
-      "avg": 1749,
+      "code": "001440",
+      "name": "대한전선",
+      "qty": 1,
+      "avg": 41800,
       "buy_cond": "w3",
-      "trade_id": "008350_20260331_092522_911",
+      "trade_id": "001440_20260416_090011_285",
       "tp_stage": 0,
-      "tp_base_qty": 28
+      "tp_base_qty": 1
     },
     {
-      "code": "018470",
-      "name": "조일알미늄",
-      "qty": 16,
-      "avg": 1536,
-      "buy_cond": "A",
-      "trade_id": "018470_20260331_092554_989",
+      "code": "001810",
+      "name": "무림SP",
+      "qty": 27,
+      "avg": 1818,
+      "buy_cond": "w3",
+      "trade_id": "001810_20260416_115035_404",
       "tp_stage": 0,
-      "tp_base_qty": 32
+      "tp_base_qty": 27
     },
     {
-      "code": "037760",
-      "name": "쎄니트",
-      "qty": 24,
-      "avg": 2010,
-      "buy_cond": "A",
-      "trade_id": "037760_20260331_093052_423",
+      "code": "002240",
+      "name": "고려제강",
+      "qty": 1,
+      "avg": 26150,
+      "buy_cond": "w3",
+      "trade_id": "002240_20260416_104638_417",
       "tp_stage": 0,
-      "tp_base_qty": 24
+      "tp_base_qty": 1
     },
     {
-      "code": "044450",
-      "name": "KSS해운",
-      "qty": 2,
-      "avg": 11120,
+      "code": "002450",
+      "name": "삼익악기",
+      "qty": 39,
+      "avg": 1269,
       "buy_cond": "A",
-      "trade_id": "044450_20260331_143338_281",
+      "trade_id": "002450_20260416_113217_016",
+      "tp_stage": 0,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "005440",
+      "name": "현대지에프홀딩스",
+      "qty": 3,
+      "avg": 14630,
+      "buy_cond": "A",
+      "trade_id": "005440_20260416_141022_829",
+      "tp_stage": 0,
+      "tp_base_qty": 3
+    },
+    {
+      "code": "009900",
+      "name": "명신산업",
+      "qty": 1,
+      "avg": 10970,
+      "buy_cond": "A",
+      "trade_id": "009900_20260416_093541_705",
       "tp_stage": 0,
       "tp_base_qty": 4
     },
     {
-      "code": "105330",
-      "name": "케이엔더블유",
-      "qty": 1,
-      "avg": 8350,
+      "code": "023800",
+      "name": "인지컨트롤스",
+      "qty": 6,
+      "avg": 7800,
       "buy_cond": "w3",
-      "trade_id": "105330_20260331_103809_794",
+      "trade_id": "023800_20260416_090020_347",
+      "tp_stage": 0,
+      "tp_base_qty": 6
+    },
+    {
+      "code": "024120",
+      "name": "KB오토시스",
+      "qty": 13,
+      "avg": 3860,
+      "buy_cond": "A",
+      "trade_id": "024120_20260416_145419_001",
+      "tp_stage": 0,
+      "tp_base_qty": 13
+    },
+    {
+      "code": "025770",
+      "name": "한국정보통신",
+      "qty": 4,
+      "avg": 10920,
+      "buy_cond": "w3",
+      "trade_id": "025770_20260416_090246_159",
+      "tp_stage": 0,
+      "tp_base_qty": 4
+    },
+    {
+      "code": "028670",
+      "name": "팬오션",
+      "qty": 8,
+      "avg": 5590,
+      "buy_cond": "A",
+      "trade_id": "028670_20260416_132930_153",
+      "tp_stage": 0,
+      "tp_base_qty": 8
+    },
+    {
+      "code": "031430",
+      "name": "신세계인터내셔날",
+      "qty": 3,
+      "avg": 13700,
+      "buy_cond": "A",
+      "trade_id": "031430_20260416_093512_615",
+      "tp_stage": 0,
+      "tp_base_qty": 3
+    },
+    {
+      "code": "031820",
+      "name": "아이티센씨티에스",
+      "qty": 33,
+      "avg": 770,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 0,
+      "tp_base_qty": 33
+    },
+    {
+      "code": "033240",
+      "name": "자화전자",
+      "qty": 1,
+      "avg": 38150,
+      "buy_cond": "A",
+      "trade_id": "033240_20260416_111613_434",
+      "tp_stage": 0,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "033560",
+      "name": "블루콤",
+      "qty": 7,
+      "avg": 3770,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 0,
+      "tp_base_qty": 7
+    },
+    {
+      "code": "036540",
+      "name": "SFA반도체",
+      "qty": 3,
+      "avg": 7380,
+      "buy_cond": "A",
+      "trade_id": "036540_20260416_123846_421",
+      "tp_stage": 0,
+      "tp_base_qty": 6
+    },
+    {
+      "code": "037070",
+      "name": "파세코",
+      "qty": 5,
+      "avg": 9200,
+      "buy_cond": "w3",
+      "trade_id": "037070_20260416_090029_144",
+      "tp_stage": 0,
+      "tp_base_qty": 5
+    },
+    {
+      "code": "038060",
+      "name": "루멘스",
+      "qty": 39,
+      "avg": 1393,
+      "buy_cond": "w3",
+      "trade_id": "038060_20260416_090012_675",
+      "tp_stage": 0,
+      "tp_base_qty": 39
+    },
+    {
+      "code": "038680",
+      "name": "에스넷",
+      "qty": 3,
+      "avg": 4405,
+      "buy_cond": "",
+      "trade_id": "",
       "tp_stage": 2,
       "tp_base_qty": 5
     },
     {
-      "code": "106240",
-      "name": "파인테크닉스",
-      "qty": 11,
-      "avg": 2350,
+      "code": "040610",
+      "name": "SG&G",
+      "qty": 23,
+      "avg": 2155,
       "buy_cond": "A",
-      "trade_id": "106240_20260331_094019_319",
+      "trade_id": "040610_20260416_123300_814",
       "tp_stage": 0,
-      "tp_base_qty": 21
+      "tp_base_qty": 23
+    },
+    {
+      "code": "041910",
+      "name": "폴라리스AI파마",
+      "qty": 2,
+      "avg": 7310,
+      "buy_cond": "A",
+      "trade_id": "041910_20260416_093440_497",
+      "tp_stage": 0,
+      "tp_base_qty": 6
+    },
+    {
+      "code": "049480",
+      "name": "오픈베이스",
+      "qty": 17,
+      "avg": 2785,
+      "buy_cond": "w3",
+      "trade_id": "049480_20260416_125742_088",
+      "tp_stage": 0,
+      "tp_base_qty": 17
+    },
+    {
+      "code": "052330",
+      "name": "코텍",
+      "qty": 4,
+      "avg": 11000,
+      "buy_cond": "w3",
+      "trade_id": "052330_20260416_121422_310",
+      "tp_stage": 0,
+      "tp_base_qty": 4
+    },
+    {
+      "code": "061970",
+      "name": "LB세미콘",
+      "qty": 10,
+      "avg": 4975,
+      "buy_cond": "A",
+      "trade_id": "061970_20260416_134803_166",
+      "tp_stage": 0,
+      "tp_base_qty": 10
+    },
+    {
+      "code": "070300",
+      "name": "엑스큐어",
+      "qty": 7,
+      "avg": 2380,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 2,
+      "tp_base_qty": 15
+    },
+    {
+      "code": "074600",
+      "name": "원익QnC",
+      "qty": 1,
+      "avg": 35200,
+      "buy_cond": "A",
+      "trade_id": "074600_20260416_141429_775",
+      "tp_stage": 0,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "077360",
+      "name": "덕산하이메탈",
+      "qty": 2,
+      "avg": 14527,
+      "buy_cond": "A",
+      "trade_id": "077360_20260416_092536_390",
+      "tp_stage": 1,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "090460",
+      "name": "비에이치",
+      "qty": 1,
+      "avg": 27900,
+      "buy_cond": "A",
+      "trade_id": "090460_20260416_095347_465",
+      "tp_stage": 0,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "092190",
+      "name": "서울바이오시스",
+      "qty": 6,
+      "avg": 4296,
+      "buy_cond": "w3",
+      "trade_id": "092190_20260416_122434_914",
+      "tp_stage": 0,
+      "tp_base_qty": 9
+    },
+    {
+      "code": "115500",
+      "name": "케이씨에스",
+      "qty": 3,
+      "avg": 17780,
+      "buy_cond": "",
+      "trade_id": "115500_20260416_140108_878",
+      "tp_stage": 0,
+      "tp_base_qty": 3
+    },
+    {
+      "code": "125210",
+      "name": "아모그린텍",
+      "qty": 4,
+      "avg": 9480,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 1,
+      "tp_base_qty": 5
+    },
+    {
+      "code": "127710",
+      "name": "아시아경제",
+      "qty": 28,
+      "avg": 1731,
+      "buy_cond": "w3",
+      "trade_id": "127710_20260416_090012_269",
+      "tp_stage": 0,
+      "tp_base_qty": 28
+    },
+    {
+      "code": "141000",
+      "name": "비아트론",
+      "qty": 2,
+      "avg": 10520,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 1,
+      "tp_base_qty": 3
+    },
+    {
+      "code": "153490",
+      "name": "우리이앤엘",
+      "qty": 16,
+      "avg": 825,
+      "buy_cond": "x2",
+      "trade_id": "153490_20260416_090003_128",
+      "tp_stage": 0,
+      "tp_base_qty": 61
+    },
+    {
+      "code": "184230",
+      "name": "SGA솔루션즈",
+      "qty": 58,
+      "avg": 856,
+      "buy_cond": "w3",
+      "trade_id": "184230_20260416_090236_675",
+      "tp_stage": 0,
+      "tp_base_qty": 58
+    },
+    {
+      "code": "187220",
+      "name": "디티앤씨",
+      "qty": 15,
+      "avg": 3175,
+      "buy_cond": "w3",
+      "trade_id": "187220_20260416_090030_144",
+      "tp_stage": 0,
+      "tp_base_qty": 15
+    },
+    {
+      "code": "204610",
+      "name": "티쓰리",
+      "qty": 17,
+      "avg": 2880,
+      "buy_cond": "w3",
+      "trade_id": "204610_20260416_150105_302",
+      "tp_stage": 0,
+      "tp_base_qty": 17
+    },
+    {
+      "code": "208350",
+      "name": "지란지교시큐리티",
+      "qty": 14,
+      "avg": 3500,
+      "buy_cond": "w3",
+      "trade_id": "208350_20260416_090016_972",
+      "tp_stage": 0,
+      "tp_base_qty": 14
+    },
+    {
+      "code": "221840",
+      "name": "하이즈항공",
+      "qty": 9,
+      "avg": 2930,
+      "buy_cond": "A",
+      "trade_id": "221840_20260416_093846_513",
+      "tp_stage": 0,
+      "tp_base_qty": 17
+    },
+    {
+      "code": "265560",
+      "name": "영화테크",
+      "qty": 5,
+      "avg": 9640,
+      "buy_cond": "w3",
+      "trade_id": "265560_20260416_093118_085",
+      "tp_stage": 0,
+      "tp_base_qty": 5
+    },
+    {
+      "code": "272290",
+      "name": "이녹스첨단소재",
+      "qty": 1,
+      "avg": 34450,
+      "buy_cond": "A",
+      "trade_id": "272290_20260416_143539_526",
+      "tp_stage": 0,
+      "tp_base_qty": 1
+    },
+    {
+      "code": "275630",
+      "name": "에스에스알",
+      "qty": 11,
+      "avg": 4425,
+      "buy_cond": "A",
+      "trade_id": "275630_20260416_143409_366",
+      "tp_stage": 0,
+      "tp_base_qty": 11
+    },
+    {
+      "code": "356680",
+      "name": "엑스게이트",
+      "qty": 2,
+      "avg": 16870,
+      "buy_cond": "",
+      "trade_id": "356680_20260416_135914_252",
+      "tp_stage": 0,
+      "tp_base_qty": 3
+    },
+    {
+      "code": "417310",
+      "name": "코람코더원리츠",
+      "qty": 4,
+      "avg": 10060,
+      "buy_cond": "",
+      "trade_id": "",
+      "tp_stage": 0,
+      "tp_base_qty": 4
+    },
+    {
+      "code": "441270",
+      "name": "파인엠텍",
+      "qty": 4,
+      "avg": 11000,
+      "buy_cond": "A",
+      "trade_id": "441270_20260416_121346_357",
+      "tp_stage": 0,
+      "tp_base_qty": 4
+    },
+    {
+      "code": "446540",
+      "name": "메가터치",
+      "qty": 9,
+      "avg": 5210,
+      "buy_cond": "w3",
+      "trade_id": "446540_20260416_090809_503",
+      "tp_stage": 0,
+      "tp_base_qty": 9
+    },
+    {
+      "code": "452190",
+      "name": "한빛레이저",
+      "qty": 4,
+      "avg": 6700,
+      "buy_cond": "w3",
+      "trade_id": "452190_20260416_102757_267",
+      "tp_stage": 0,
+      "tp_base_qty": 7
     }
   ]
 }

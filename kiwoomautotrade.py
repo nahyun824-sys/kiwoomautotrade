@@ -53,12 +53,15 @@ AUTO_SELL_INTERVAL_SEC = 60
 
 TRAILING_STOP_PCT = 8.0
 BALANCE_COOLDOWN_SEC = 3.0
+
 SYNC_INTERVAL_SEC = 15.0
 PRICE_REQ_INTERVAL = 0.25
 PRICE_RETRY_MAX = 3
 PRICE_RETRY_SLEEP = 0.8
 PRICE_CACHE_HARD_TTL_SEC = 15.0
 ORDER_INTENT_TIMEOUT_SEC = 12.0
+
+
 CONDITION_CHATTER_WINDOW_SEC = 15.0
 CONDITION_CHATTER_COUNT = 4
 CONDITION_CHATTER_EXTRA_DELAY_SEC = 2.0
@@ -146,7 +149,7 @@ COND_RISK_CONFIG = {
     },
     "w3": {
         "stoploss_enabled": True,
-        "takeprofit_enabled": True,
+        "takeprofit_enabled": False,
         "trailing_enabled": True,
         "stoploss_tiers": [(-2.0, 0.50), (-2.7, 0.50), (-3.2, 1.00)],
         "takeprofit_levels": [(8.0, 0.60), (15.0, 0.20)],
@@ -164,12 +167,26 @@ COND_RISK_CONFIG = {
 CONDITION_FORCE_SELL_ENABLED = True
 COND_FORCE_SELL_CONFIG = {
     "A": [
-        # {"weekdays": ["FRI"], "hour": 14, "minute": 0, "action": "SELL_ALL", "reason": "A_FRI_1400_FORCE_EXIT", "once_per_day": True},
+        {
+            "weekdays": ["FRI"], 
+            "hour": 14, 
+            "minute": 0, 
+            "action": "SELL_ALL", 
+            "reason": "A_FRI_1400_FORCE_EXIT", 
+            "once_per_day": True
+        }
     ],
-    "x2": [{"weekdays": ["FRI"], "hour": 14, "minute": 0, "action": "SELL_ALL", "reason": "A_FRI_1400_FORCE_EXIT", "once_per_day": True}
-    ],
-    "w3": [
-    ],
+    "x2": [
+        {
+            "weekdays": ["FRI"], 
+            "hour": 14, 
+            "minute": 0, 
+            "action": "SELL_ALL", 
+            "reason": "A_FRI_1400_FORCE_EXIT", 
+            "once_per_day": True
+            }
+        ],
+    "w3": [],
 }
 
 
